@@ -1,0 +1,22 @@
+#Ignore Hidden MacOS System Files
+.DS_Store
+
+#Ignore Sensitive Files with Keys, Passwords etc.
+partners/*/data/
+common/ovid_secrets.py
+ovid_setup/install_settings.py
+common/cdm/omop_5_3/*.csv
+
+# Make sure sample/example files are tracked
+!common/ovid_secrets_example.py
+!ovid_setup/install_settings_sample.py
+# Ignore the installation of Python
+Python-3.10.5
+# Ignore log files created as part of the process.
+*.log
+
+# Ignore folder created when code is executed
+__pycache__/
+*.pyc
+
+*.py.un~
