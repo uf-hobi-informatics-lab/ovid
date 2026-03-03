@@ -1,0 +1,38 @@
+# Ignore Hidden MacOS System Files
+.DS_Store
+
+# Ignore Sensitive Files with Keys, Passwords etc.
+partners/**/data/
+common/ovid_secrets.py
+ovid_setup/install_settings.py
+common/cdm/omop_5_3/*.csv
+
+# Safety net for credential, key, and environment files
+*.p8
+*.pem
+*.key
+*.pfx
+*.env
+.env.*
+
+# Ignore the installation of Python
+Python-3.10.5
+
+# Ignore log files created as part of the process.
+*.log
+
+# Ignore folder created when code is executed
+__pycache__/
+*.pyc
+
+# Ignore editor/IDE temp and config files
+*.py.un~
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Ignore runtime and generated files
+work_directory/docker_data/spark_tmp/
+docker-compose.yml

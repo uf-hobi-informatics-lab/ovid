@@ -1,0 +1,12 @@
+# requirements.txt
+numpy
+pandas
+pycrypto
+openpyxl
+matplotlib
+python-dateutil
+pyarrow
+sqlalchemy
+xlsxwriter
+snowflake-connector-python
+pycryptodome
