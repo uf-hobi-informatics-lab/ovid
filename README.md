@@ -5,7 +5,7 @@ Developed and maintained by **OneFlorida+**
 - Abdelali Nouina - abdelali@ufl.edu
 - Alexander T. Loiacono - atloiaco@ufl.edu
 
-Last Updated: 2/18/2026
+Last Updated: 9/15/2026
 
 # Ovid
 
@@ -87,9 +87,10 @@ Ovid uses a command-line interface with subcommands for different pipelines.
 
 Available commands:
 - `etl` - Run ETL jobs (format, deduplicate, map, fix, upload)
-- `analysis` - Run analysis jobs (format, monthly_counts, distinct_values)
-- `dq_checks` - Run data quality checks (format, mapping_gap, mapping_report)
+- `analysis` - Run analysis jobs (format, monthly_counts, distinct_values, raw_distinct_values)
+- `dq_checks` - Run data quality checks (format, mapping_gap, mapping_report, dc_checks)
 - `scheduler` - Run the scheduler to process data batches
+- `tools` - Run utility jobs (raw_upload)
 
 
 ## Default Parameters
@@ -257,7 +258,7 @@ The job will be `map`, not `all`, because command-line arguments take priority.
 | `-p, --partner` | Partner or site name (required) |
 | `-f, --ovid_input_folder` | Input folder name(s) (required) |
 | `-t, --table` | Table name(s) |
-| `-j, --job` | Job type: `all`, `format`, `monthly_counts`, `distinct_values` |
+| `-j, --job` | Job type: `all`, `format`, `monthly_counts`, `distinct_values`, `raw_distinct_values` |
 | `-wc, --workers_count` | Number of Spark workers |
 
 ## DQ Checks Parameters

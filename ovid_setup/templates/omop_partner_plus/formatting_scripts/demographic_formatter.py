@@ -92,7 +92,6 @@ try:
                                                     joined_person['ethnicity_source_value'].alias("RAW_HISPANIC"),
                                                     joined_person['race_source_value'].alias("RAW_RACE"),
                                                     joined_person['spoken_language_source_value'].alias("RAW_PAT_PREF_LANGUAGE_SPOKEN"),
-                                                    lit('').alias("ZIP_CODE"),
 
 
                                                         )

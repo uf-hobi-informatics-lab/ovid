@@ -121,7 +121,6 @@ try:
                                     unmapped_demographic['RAW_PAT_PREF_LANGUAGE_SPOKEN'].alias("RAW_PAT_PREF_LANGUAGE_SPOKEN"),
                                     cf.get_current_time_udf().alias("UPDATED"),
                                     lit(input_partner.upper()).alias("SOURCE"),
-                                    unmapped_demographic['ZIP_CODE'].alias("ZIP_CODE"),
                                     unmapped_demographic['PATID'].alias("JOIN_FIELD"),
                                 
 

@@ -57,6 +57,17 @@ fixes = {
     # "1": {"fix_type":"common",    "fix_name":"patid_orphans_fix",   "version":"1.0", "src1":"mapped_demographic.csv", "src2":"NotUsed"},
     # "2": {"fix_type":"custom",    "fix_name":"patid_orphans",   "version":"2.0"},
     # "3": {"fix_type":"custom",    "fix_name":"patid_orphans",   "version":"1.0"},
+    # Provider-orphan removal (deletes PROVIDER rows unreferenced by any clinical table).
+    # IMPORTANT: trim src1 to ONLY the provider-referencing tables THIS partner delivers.
+    # The fix aborts without deleting if ANY listed table is missing at fix time, so listing
+    # a table the partner never sends would make the fix a permanent no-op. Provider-id columns:
+    #   encounter/diagnosis/procedures -> PROVIDERID, prescribing -> RX_PROVIDERID,
+    #   med_admin -> MEDADMIN_PROVIDERID, obs_clin -> OBSCLIN_PROVIDERID,
+    #   obs_gen -> OBSGEN_PROVIDERID, immunization -> VX_PROVIDERID
+    # OMOP partners typically deliver no med_admin/immunization; example src1:
+    # "4": {"fix_type":"common", "fix_name":"remove_unreferenced_provider_fix", "version":"1.0",
+    #       "src1":"mapped_encounter.csv:PROVIDERID,mapped_diagnosis.csv:PROVIDERID,mapped_procedures.csv:PROVIDERID,mapped_prescribing.csv:RX_PROVIDERID,mapped_obs_clin.csv:OBSCLIN_PROVIDERID,mapped_obs_gen.csv:OBSGEN_PROVIDERID",
+    #       "src2":"NotUsed"},
 
 
 

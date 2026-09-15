@@ -4,25 +4,29 @@ import importlib
 import sys
 import os
 import subprocess
+import fnmatch
 import pyspark
 from pyspark.sql import SparkSession
 import argparse
 from datetime import datetime
 import pytz
 from settings import  VALID_ANALYSIS_JOBS
-from ovid_logging import setup_logging, get_logger, log_job_start, log_job_end
+from ovid_logging import setup_logging, get_logger, log_job_start, log_job_end, print_pipeline_summary
 
 from PIL import Image
+
+# Ensure /app/common is on PYTHONPATH for all subprocesses.
+# spark-submit --py-files distributes common.zip via temp dirs that may be
+# cleaned up after spark.stop(), breaking imports in child processes.
+_pypath = os.environ.get('PYTHONPATH', '')
+if '/app/common' not in _pypath:
+    os.environ['PYTHONPATH'] = '/app/common' + (':' + _pypath if _pypath else '')
 
 master_url = os.environ["SPARK_URL"].strip().replace('"', '')
 
 # Extract timestamp from master URL (format: spark://ovid-master-YYYYMMDD-HHMMSS:7077)
 master_name = master_url.replace('spark://', '').replace(':7077', '')
 timestamp = master_name.replace('ovid-master-', '')
-
-print('*********************************************************************')
-print(master_url)
-print('*********************************************************************')
 
 
 spark = SparkSession.builder.master(master_url).appName("Ovid").getOrCreate()
@@ -32,9 +36,6 @@ spark = SparkSession.builder.master(master_url).appName("Ovid").getOrCreate()
 spark.sparkContext.setLogLevel('OFF')
 spark.stop()
 
-print("PYTHONPATH:", sys.path)
-                                    
- 
 
 job_num = 0
 
@@ -54,6 +55,7 @@ parser.add_argument("-s", "--db_server")
 parser.add_argument("-f", "--data_folder",nargs="+")
 parser.add_argument("-dt", "--database_type")
 parser.add_argument("-dc", "--dc_check" ,nargs="+")
+parser.add_argument("-fld", "--field", nargs="+")
 
 
 
@@ -67,6 +69,21 @@ input_db_server = args.db_server
 input_data_folders = args.data_folder
 input_db_type = args.database_type
 input_dc_checks = args.dc_check
+input_fields = args.field if args.field is not None else ['all']
+
+# Print startup summary
+print_pipeline_summary("OVID Analysis Pipeline", [
+    ("Partner",   input_partner),
+    ("Folder(s)", ', '.join(input_data_folders) if input_data_folders else 'N/A'),
+    ("Jobs",      ', '.join(input_jobs) if input_jobs else 'N/A'),
+    ("Tables",    ', '.join(input_tables) if input_tables else 'N/A'),
+    ("Fields",    ', '.join(input_fields) if input_fields else 'all'),
+    ("Instance",  timestamp),
+])
+# Flush stdout immediately so the banner reaches the host-side log streamer
+# even when the parent harness (opencode/ansible/CI) buffers or terminates
+# stdout before the live-display thread connects.
+sys.stdout.flush()
 
 # Initialize logging with timestamp and partner
 logger = setup_logging(timestamp=timestamp, partner=input_partner)
@@ -80,15 +97,10 @@ logger.info("=" * 60)
 logger.info("Starting Analysis job execution")
 logger.info("=" * 60)
 
-print("""
-
-                            ▄█  ░█▀▀▀ ░█       ░█▀▀█ ░█ ░█  █▀▀█ ░█▄ ░█ ░█▀▀█ ░█▀▀▀ ▀█▀ ░█▄ ░█  █▀▀█ ▀▀█▀▀ ░█▀▀▀█ ░█▀▀█ 
-                             █  ░█▀▀▀ ░█    ▀▀ ░█    ░█▀▀█ ░█▄▄█ ░█░█░█ ░█ ▄▄ ░█▀▀▀ ░█  ░█░█░█ ░█▄▄█  ░█   ░█  ░█ ░█▄▄▀ 
-                            ▄█▄ ░█    ░█▄▄█    ░█▄▄█ ░█ ░█ ░█ ░█ ░█  ▀█ ░█▄▄█ ░█▄▄▄ ▄█▄ ░█  ▀█ ░█ ░█  ░█   ░█▄▄▄█ ░█ ░█
-
-                                                                                                                                                            
-                                                                              """
-                                                   )
+for folder in input_data_folders:
+    logger.info(f"Processing folder: {folder}")
+    if 'all' in input_jobs:
+        logger.info("Running all analysis jobs: format -> monthly_counts -> distinct_values")
 
 ###################################################################################################################################
 # This function will get all the created formatter python script and return a list of thier names
@@ -196,8 +208,8 @@ def run_formatter(partner, formatter, folder):
     # command = ["python", "/app/partners/"+partner+"/formatting_scripts/"+formatter, '-f', folder , '' ]
 
     command = ["python", "/app/partners/"+partner+"/formatting_scripts/"+formatter, '-f', folder , '-p', partner  ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    # Execute the command (logging handled in-process by print_with_style)
+    cf.run_subprocess(" ".join(command), shell=True)
 
 
 
@@ -210,12 +222,34 @@ def run_fixer(partner, fixer, folder):
     global job_num
 
     job_num = job_num +1
-    cf.print_run_status(job_num,total_jobs_count,fixer, folder, partner)
+    
+    # Set work directory for sync files
+    import os
+    work_dir = f"/app/partners/{partner}/data/{folder}"
+    
+    # Print status with subprocess_mode=True to avoid race condition
+    cf.print_run_status(job_num, total_jobs_count, fixer, folder, partner, subprocess_mode=True)
+    
+    # Set up sync files (subprocess_running is already True from print_run_status)
+    cf.pause_timer_for_subprocess(work_dir=work_dir)
 
-
-    command = ["python", "/app/partners/"+partner+"/fixer_scripts/"+fixer, '-f', folder  ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    command = ["python", "/app/partners/"+partner+"/fixer_scripts/"+fixer, '-f', folder]
+    
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+    if cf._overall_start_time:
+        env['OVID_OVERALL_START_TIME'] = cf._overall_start_time.isoformat()
+    env['OVID_WORK_DIR'] = work_dir
+    # Ensure /app/common is on PYTHONPATH so subprocesses can import commonFunctions
+    existing_pypath = env.get('PYTHONPATH', '')
+    if '/app/common' not in existing_pypath:
+        env['PYTHONPATH'] = '/app/common' + (':' + existing_pypath if existing_pypath else '')
+    
+    # Execute the command (output captured to log, not terminal)
+    cf.run_subprocess(command, env=env)
+    
+    # Resume the timer after fixer subprocess completes
+    cf.resume_timer_after_subprocess()
 
 ###################################################################################################################################
 # This function will run the deduplicator script for a single table
@@ -235,8 +269,8 @@ def run_deduplicator(partner, input_folder, output_folder):
         # add table list
         command.append(table)
 
-        # Execute the command
-        subprocess.run(" ".join(command), shell=True)
+        # Execute the command (logging handled in-process by print_with_style)
+        cf.run_subprocess(" ".join(command), shell=True)
 ###################################################################################################################################
 # This function will run the deduplicator script for a single table
 ###################################################################################################################################
@@ -255,8 +289,8 @@ def run_deduplicator(partner, input_folder, output_folder):
         # add table list
         command.append(table)
 
-        # Execute the command
-        subprocess.run(" ".join(command), shell=True)
+        # Execute the command (logging handled in-process by print_with_style)
+        cf.run_subprocess(" ".join(command), shell=True)
 
 ###################################################################################################################################
 # This function will run the mapper script for a single table
@@ -274,8 +308,8 @@ def run_mapper(partner, mapper, folder):
     cf.print_run_status(job_num,total_jobs_count, mapper, folder, partner)
 
     command = ["python", "/app/mapping_scripts/"+partner_settings.mappers_type+"/"+mapper,"-p",partner, '-f', folder ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    # Execute the command (logging handled in-process by print_with_style)
+    cf.run_subprocess(" ".join(command), shell=True)
 
     
 
@@ -375,8 +409,8 @@ def run_dc_check(partner, dc_check, folder):
 
 
     command = ["python", "/app/dc_checks_scripts/"+dc_check+'.py', '-f', folder , '-p', partner]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    # Execute the command (logging handled in-process by print_with_style)
+    cf.run_subprocess(" ".join(command), shell=True)
 
 ###################################################################################################################################
 # This function will run the deduplicators script
@@ -602,7 +636,9 @@ def run_upload_jobs(folder):
                 table_name = file_name.replace('fixed_',"").replace('.csv',"")
 
                 job_num = job_num +1
-                cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{folder.upper()}.{table_name.upper()}", folder, input_partner)
+                # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                schema_date = folder.split('/')[-1] if '/' in folder else folder
+                cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table_name.upper()}", folder, input_partner)
 
 
                 schemas = cf.get_schemas( table_name.upper(), fixed_files_path)
@@ -638,7 +674,9 @@ def run_upload_jobs(folder):
                     if os.path.exists(fixed_files_path+fixed_table_name):
 
                         job_num = job_num +1
-                        cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{folder.upper()}.{table.upper()}", folder, input_partner)
+                        # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                        schema_date = folder.split('/')[-1] if '/' in folder else folder
+                        cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table.upper()}", folder, input_partner)
 
 
                         schemas = cf.get_schemas(table.upper(),fixed_files_path)
@@ -740,7 +778,7 @@ folders_count = len(input_data_folders)
 
 
 if 'all' in  input_jobs:
-    jobs_count = 4
+    jobs_count = 5  # format, deduplicate, map, fix, upload
 else:
     jobs_count = len(input_jobs)
 
@@ -751,9 +789,9 @@ try:
     else:
         tables_count = len(input_tables)
 except:
-    pass
+    tables_count = 1
 
-total_jobs_count = '**' #folders_count * jobs_count * tables_count
+total_jobs_count = folders_count * jobs_count * tables_count
 
 
 ###################################################################################################################################
@@ -889,21 +927,146 @@ def run_distinct_values_jobs(folder):
                          file_path= formatted_files_list_path,
                          folder_name = folder
                           )
+
+###################################################################################################################################
+# This function will compute distinct values directly on raw input files in /data/{folder}/.
+# Unlike run_distinct_values_jobs which operates on formatter_output, this targets the
+# untouched OMOP-format (or any csv/tsv) source files. It supports glob patterns for
+# both file names (-t) and field names (-fld), enriches *_concept_id columns with
+# concept_name/code/vocabulary_id from a global OMOP CONCEPT.csv if present, and
+# generates a comprehensive Excel report at the end.
+###################################################################################################################################
+
+def run_raw_distinct_values_jobs(folder: str) -> None:
+    """Run distinct-value profiling on raw input files in /data/{folder}/.
+
+    Files are matched by user-supplied -t glob patterns (or 'all'). Every
+    file matching a single explicit pattern is grouped into one logical
+    table -- so ``-t measurement`` profiles all measurement-named files
+    (e.g. chunked ``measurement_1.csv``, ``measurement_2.csv``) as a
+    single dataset producing one section in the PDF and one output
+    subdirectory. The ``-t all`` shortcut keeps the historical
+    one-section-per-file rendering. Fields within each group are matched
+    by ``-fld`` glob patterns (or ``'all'``). Outputs land at
+    ``partners/{partner}/data/{folder}/raw_distinct_values/{group_name}/``,
+    plus a single comprehensive PDF report named
+    ``{partner}_{folder_label}_raw_distinct_values_report.pdf``.
+
+    Args:
+        folder: Data delivery folder identifier (e.g. 'UCI/20251121').
+    """
+    global job_num
+
+    raw_input_dir = f'/data/{folder}/'
+    concept_table_path = '/app/common/omop_cdm/CONCEPT.csv'
+
+    matched_groups = cf._raw_dv_match_files_grouped(raw_input_dir, input_tables)
+
+    if not matched_groups:
+        logger.warning(
+            f"[raw_distinct_values] no files in {raw_input_dir} matched table patterns {input_tables}"
+        )
+        return
+
+    total_files = sum(len(g["files"]) for g in matched_groups)
+    logger.info(
+        f"[raw_distinct_values] matched {total_files} file(s) in {len(matched_groups)} "
+        f"group(s) under {raw_input_dir}"
+    )
+
+    file_results = []
+    for group in matched_groups:
+        job_num = job_num + 1
+        group_name = group["group_name"]
+        group_files = group["files"]
+        group_pattern = group.get("pattern", "")
+        cf.print_run_status(
+            job_num,
+            total_jobs_count,
+            f"raw distinct values for '{group_name}' ({len(group_files)} file(s))",
+            folder,
+            input_partner,
+        )
+
+        result = cf.get_raw_distinct_values(
+            partner=input_partner,
+            folder_name=folder,
+            group_name=group_name,
+            file_paths=group_files,
+            field_patterns=input_fields,
+            concept_table_path=concept_table_path,
+        )
+        # Surface the originating pattern in the result so the report's
+        # _group_meta.csv (and any future diagnostic) can show it.
+        if group_pattern:
+            result["pattern"] = group_pattern
+        file_results.append(result)
+
+    # Build the PDF report after all per-group CSVs are written.
+    job_num = job_num + 1
+    cf.print_run_status(
+        job_num,
+        total_jobs_count,
+        "generating raw distinct values PDF report",
+        folder,
+        input_partner,
+    )
+    cf.generate_raw_distinct_values_report(
+        partner=input_partner,
+        folder_name=folder,
+        file_results=file_results,
+    )
+
+    # Diagnostic: warn when any -fld pattern matched no column in any
+    # profiled group. Helps catch typos like 'procedure_concept_idd'. The
+    # 'all' pattern is excluded from this check because it always trivially
+    # matches.
+    try:
+        all_profiled_columns = {
+            str(c["column"]).lower()
+            for fr in file_results
+            for c in fr.get("columns", [])
+        }
+        unmatched: list = []
+        for pat in input_fields or []:
+            if str(pat).lower() == "all":
+                continue
+            pat_lower = str(pat).lower()
+            if not any(
+                fnmatch.fnmatch(c, pat_lower) for c in all_profiled_columns
+            ):
+                unmatched.append(pat)
+        if unmatched:
+            logger.warning(
+                f"[raw_distinct_values] field pattern(s) matched no column "
+                f"in any profiled group: {', '.join(unmatched)}"
+            )
+    except Exception as warn_exc:
+        logger.warning(
+            f"[raw_distinct_values] failed to compute unmatched-field warning: {warn_exc}"
+        )
 ###################################################################################################################################
 # submitting the jobs to be run
 ###################################################################################################################################
- 
+
+print("""
+      
+
+                            ▄█  ░█▀▀▀ ░█       ░█▀▀█ ░█ ░█  █▀▀█ ░█▄ ░█ ░█▀▀█ ░█▀▀▀ ▀█▀ ░█▄ ░█  █▀▀█ ▀▀█▀▀ ░█▀▀▀█ ░█▀▀█
+                             █  ░█▀▀▀ ░█    ▀▀ ░█    ░█▀▀█ ░█▄▄█ ░█░█░█ ░█ ▄▄ ░█▀▀▀ ░█  ░█░█░█ ░█▄▄█  ░█   ░█  ░█ ░█▄▄▀
+                            ▄█▄ ░█    ░█▄▄█    ░█▄▄█ ░█ ░█ ░█ ░█ ░█  ▀█ ░█▄▄█ ░█▄▄▄ ▄█▄ ░█  ▀█ ░█ ░█  ░█   ░█▄▄▄█ ░█ ░█
+  
+      
+        """)
 
 for folder in input_data_folders:
 
-    logger.info(f"Processing folder: {folder}")
-
     if  'all' in input_jobs:
 
-        logger.info("Running all analysis jobs: format -> monthly_counts -> distinct_values")
         run_formatters_jobs(folder)
         run_monthly_counts_jobs(folder)
         run_distinct_values_jobs(folder)
+        run_raw_distinct_values_jobs(folder)
 
     else :
 
@@ -920,23 +1083,19 @@ for folder in input_data_folders:
             logger.info("Starting DISTINCT_VALUES job")
             run_distinct_values_jobs(folder)
 
+        if  'raw_distinct_values' in input_jobs:
+            logger.info("Starting RAW_DISTINCT_VALUES job")
+            run_raw_distinct_values_jobs(folder)
 
-    logger.info(f"Completed processing folder: {folder}")
-
-
-        
-
-    
-
-logger.info("=" * 60)
-logger.info("Analysis Pipeline completed successfully")
-logger.info("=" * 60)
 
 print("""
+      
 
                                                     ▀▀█▀▀ ░█ ░█ ░█▀▀▀ 　 ░█▀▀▀ ░█▄ ░█ ░█▀▀▄ 　 █ 
                                                      ░█   ░█▀▀█ ░█▀▀▀ 　 ░█▀▀▀ ░█░█░█ ░█ ░█ 　 ▀ 
                                                      ░█   ░█ ░█ ░█▄▄▄ 　 ░█▄▄▄ ░█  ▀█ ░█▄▄▀ 　 ▄
             
-    """)
+    
+      """)
+             
              

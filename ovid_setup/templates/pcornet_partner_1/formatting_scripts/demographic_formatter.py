@@ -69,7 +69,6 @@ try:
                             demographic_IN['raw_hispanic'].alias('RAW_HISPANIC'),
                             demographic_IN['raw_race'].alias('RAW_RACE'),
                             demographic_IN['raw_pat_pref_language_spoken'].alias('RAW_PAT_PREF_LANGUAGE_SPOKEN'),
-                            demographic_IN['zipcode'].alias('ZIP_CODE'),
 
 
         )
@@ -94,7 +93,6 @@ try:
                         demographic_IN['RAW_HISPANIC'].alias('RAW_HISPANIC'),
                         demographic_IN['RAW_RACE'].alias('RAW_RACE'),
                         demographic_IN['RAW_PAT_PREF_LANGUAGE_SPOKEN'].alias('RAW_PAT_PREF_LANGUAGE_SPOKEN'),
-                        demographic_IN['ZIPCODE'].alias('ZIP_CODE'),
 
 
     )

@@ -100,6 +100,18 @@ try:
                        output_file_name = "formatted_hash_token.csv",
                        output_data_folder_path= formatter_output_data_folder_path)
 
+   # Ancillary export: drop a timestamped Datavant match-ready file into the
+   # shared inbox (DATAVANT_MATCH_INBOX_DIR) for downstream match-ID generation.
+   # Runs both '--from <DATAVANT_KEY>' and '--to datavant' transforms. Requires
+   # partner_settings.DATAVANT_KEY to be set; otherwise it no-ops with a warning.
+   # Never raises on failure; the PCORnet pipeline continues either way.
+   cf.datavant_export_to_datavant_inbox(
+       input_file_path = input_data_folder_path,
+       file_name       = datavant_hash_token_table_name,
+       folder          = input_data_folder,
+       partner         = partner_name.lower(),
+   )
+
    spark.stop()
 
 

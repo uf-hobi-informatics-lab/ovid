@@ -10,9 +10,16 @@ import argparse
 from datetime import datetime
 import pytz
 from settings import  VALID_DQ_CHECKS_JOBS
-from ovid_logging import setup_logging, get_logger, log_job_start, log_job_end
+from ovid_logging import setup_logging, get_logger, log_job_start, log_job_end, print_pipeline_summary
 
 from PIL import Image
+
+# Ensure /app/common is on PYTHONPATH for all subprocesses.
+# spark-submit --py-files distributes common.zip via temp dirs that may be
+# cleaned up after spark.stop(), breaking imports in child processes.
+_pypath = os.environ.get('PYTHONPATH', '')
+if '/app/common' not in _pypath:
+    os.environ['PYTHONPATH'] = '/app/common' + (':' + _pypath if _pypath else '')
 
 
 master_url = os.environ["SPARK_URL"].strip().replace('"', '')
@@ -20,10 +27,6 @@ master_url = os.environ["SPARK_URL"].strip().replace('"', '')
 # Extract timestamp from master URL (format: spark://ovid-master-YYYYMMDD-HHMMSS:7077)
 master_name = master_url.replace('spark://', '').replace(':7077', '')
 timestamp = master_name.replace('ovid-master-', '')
-
-print('*********************************************************************')
-print(master_url)
-print('*********************************************************************')
 
 
 spark = SparkSession.builder.master(master_url).appName("Ovid").getOrCreate()
@@ -33,8 +36,6 @@ spark = SparkSession.builder.master(master_url).appName("Ovid").getOrCreate()
 spark.sparkContext.setLogLevel('OFF')
 spark.stop()
 
-print("PYTHONPATH:", sys.path) 
- 
 
 job_num = 0
 
@@ -68,6 +69,19 @@ input_data_folders = args.data_folder
 input_db_type = args.database_type
 input_dc_checks = args.dc_check
 
+# Print startup summary
+print_pipeline_summary("OVID DQ Checks Pipeline", [
+    ("Partner",   input_partner),
+    ("Folder(s)", ', '.join(input_data_folders) if input_data_folders else 'N/A'),
+    ("Jobs",      ', '.join(input_jobs) if input_jobs else 'N/A'),
+    ("Tables",    ', '.join(input_tables) if input_tables else 'N/A'),
+    ("Instance",  timestamp),
+])
+# Flush stdout immediately so the banner reaches the host-side log streamer
+# even when the parent harness (opencode/ansible/CI) buffers or terminates
+# stdout before the live-display thread connects.
+sys.stdout.flush()
+
 # Initialize logging with timestamp and partner
 logger = setup_logging(timestamp=timestamp, partner=input_partner)
 logger.info(f"DQ Checks Pipeline started - Partner: {input_partner}, Jobs: {input_jobs}, Tables: {input_tables}")
@@ -80,15 +94,10 @@ logger.info("=" * 60)
 logger.info("Starting DQ Checks job execution")
 logger.info("=" * 60)
 
-print("""
-
-                            ▄█  ░█▀▀▀ ░█       ░█▀▀█ ░█ ░█  █▀▀█ ░█▄ ░█ ░█▀▀█ ░█▀▀▀ ▀█▀ ░█▄ ░█  █▀▀█ ▀▀█▀▀ ░█▀▀▀█ ░█▀▀█ 
-                             █  ░█▀▀▀ ░█    ▀▀ ░█    ░█▀▀█ ░█▄▄█ ░█░█░█ ░█ ▄▄ ░█▀▀▀ ░█  ░█░█░█ ░█▄▄█  ░█   ░█  ░█ ░█▄▄▀ 
-                            ▄█▄ ░█    ░█▄▄█    ░█▄▄█ ░█ ░█ ░█ ░█ ░█  ▀█ ░█▄▄█ ░█▄▄▄ ▄█▄ ░█  ▀█ ░█ ░█  ░█   ░█▄▄▄█ ░█ ░█
-
-                                                                                                                                                            
-                                                                              """
-                                                   )
+for folder in input_data_folders:
+    logger.info(f"Processing folder: {folder}")
+    if 'all' in input_jobs:
+        logger.info("Running all DQ checks jobs: format -> mapping_gap -> mapping_report")
 
 ###################################################################################################################################
 # This function will get all the created formatter python script and return a list of thier names
@@ -196,8 +205,8 @@ def run_formatter(partner, formatter, folder):
     # command = ["python", "/app/partners/"+partner+"/formatting_scripts/"+formatter, '-f', folder , '' ]
 
     command = ["python", "/app/partners/"+partner+"/formatting_scripts/"+formatter, '-f', folder , '-p', partner  ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    # Execute the command (logging handled in-process by print_with_style)
+    cf.run_subprocess(" ".join(command), shell=True)
 
 
 
@@ -210,12 +219,34 @@ def run_fixer(partner, fixer, folder):
     global job_num
 
     job_num = job_num +1
-    cf.print_run_status(job_num,total_jobs_count,fixer, folder, partner)
+    
+    # Set work directory for sync files
+    import os
+    work_dir = f"/app/partners/{partner}/data/{folder}"
+    
+    # Print status with subprocess_mode=True to avoid race condition
+    cf.print_run_status(job_num, total_jobs_count, fixer, folder, partner, subprocess_mode=True)
+    
+    # Set up sync files (subprocess_running is already True from print_run_status)
+    cf.pause_timer_for_subprocess(work_dir=work_dir)
 
-
-    command = ["python", "/app/partners/"+partner+"/fixer_scripts/"+fixer, '-f', folder  ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    command = ["python", "/app/partners/"+partner+"/fixer_scripts/"+fixer, '-f', folder]
+    
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+    if cf._overall_start_time:
+        env['OVID_OVERALL_START_TIME'] = cf._overall_start_time.isoformat()
+    env['OVID_WORK_DIR'] = work_dir
+    # Ensure /app/common is on PYTHONPATH so subprocesses can import commonFunctions
+    existing_pypath = env.get('PYTHONPATH', '')
+    if '/app/common' not in existing_pypath:
+        env['PYTHONPATH'] = '/app/common' + (':' + existing_pypath if existing_pypath else '')
+    
+    # Execute the command (output captured to log, not terminal)
+    cf.run_subprocess(command, env=env)
+    
+    # Resume the timer after fixer subprocess completes
+    cf.resume_timer_after_subprocess()
 
 ###################################################################################################################################
 # This function will run the deduplicator script for a single table
@@ -235,8 +266,8 @@ def run_deduplicator(partner, input_folder, output_folder):
         # add table list
         command.append(table)
 
-        # Execute the command
-        subprocess.run(" ".join(command), shell=True)
+        # Execute the command (logging handled in-process by print_with_style)
+        cf.run_subprocess(" ".join(command), shell=True)
 ###################################################################################################################################
 # This function will run the deduplicator script for a single table
 ###################################################################################################################################
@@ -255,8 +286,8 @@ def run_deduplicator(partner, input_folder, output_folder):
         # add table list
         command.append(table)
 
-        # Execute the command
-        subprocess.run(" ".join(command), shell=True)
+        # Execute the command (logging handled in-process by print_with_style)
+        cf.run_subprocess(" ".join(command), shell=True)
 
 ###################################################################################################################################
 # This function will run the mapper script for a single table
@@ -274,8 +305,8 @@ def run_mapper(partner, mapper, folder):
     cf.print_run_status(job_num,total_jobs_count, mapper, folder, partner)
 
     command = ["python", "/app/mapping_scripts/"+partner_settings.mappers_type+"/"+mapper,"-p",partner, '-f', folder ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    # Execute the command (logging handled in-process by print_with_style)
+    cf.run_subprocess(" ".join(command), shell=True)
 
     
 
@@ -375,8 +406,8 @@ def run_dc_check(partner, dc_check, folder):
 
 
     command = ["python", "/app/dc_checks_scripts/"+dc_check+'.py', '-f', folder , '-p', partner]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    # Execute the command (logging handled in-process by print_with_style)
+    cf.run_subprocess(" ".join(command), shell=True)
 
 ###################################################################################################################################
 # This function will run the deduplicators script
@@ -602,7 +633,9 @@ def run_upload_jobs(folder):
                 table_name = file_name.replace('fixed_',"").replace('.csv',"")
 
                 job_num = job_num +1
-                cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{folder.upper()}.{table_name.upper()}", folder, input_partner)
+                # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                schema_date = folder.split('/')[-1] if '/' in folder else folder
+                cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table_name.upper()}", folder, input_partner)
 
 
                 schemas = cf.get_schemas( table_name.upper(), fixed_files_path)
@@ -638,7 +671,9 @@ def run_upload_jobs(folder):
                     if os.path.exists(fixed_files_path+fixed_table_name):
 
                         job_num = job_num +1
-                        cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{folder.upper()}.{table.upper()}", folder, input_partner)
+                        # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                        schema_date = folder.split('/')[-1] if '/' in folder else folder
+                        cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table.upper()}", folder, input_partner)
 
 
                         schemas = cf.get_schemas(table.upper(),fixed_files_path)
@@ -740,7 +775,7 @@ folders_count = len(input_data_folders)
 
 
 if 'all' in  input_jobs:
-    jobs_count = 4
+    jobs_count = 5  # format, deduplicate, map, fix, upload
 else:
     jobs_count = len(input_jobs)
 
@@ -751,9 +786,9 @@ try:
     else:
         tables_count = len(input_tables)
 except:
-    pass
+    tables_count = 1
 
-total_jobs_count = '**' #folders_count * jobs_count * tables_count
+total_jobs_count = folders_count * jobs_count * tables_count
 
 
 ###################################################################################################################################
@@ -892,15 +927,21 @@ def run_distinct_values_jobs(folder):
 ###################################################################################################################################
 # submitting the jobs to be run
 ###################################################################################################################################
- 
+
+print("""
+      
+
+                            ▄█  ░█▀▀▀ ░█       ░█▀▀█ ░█ ░█  █▀▀█ ░█▄ ░█ ░█▀▀█ ░█▀▀▀ ▀█▀ ░█▄ ░█  █▀▀█ ▀▀█▀▀ ░█▀▀▀█ ░█▀▀█
+                             █  ░█▀▀▀ ░█    ▀▀ ░█    ░█▀▀█ ░█▄▄█ ░█░█░█ ░█ ▄▄ ░█▀▀▀ ░█  ░█░█░█ ░█▄▄█  ░█   ░█  ░█ ░█▄▄▀
+                            ▄█▄ ░█    ░█▄▄█    ░█▄▄█ ░█ ░█ ░█ ░█ ░█  ▀█ ░█▄▄█ ░█▄▄▄ ▄█▄ ░█  ▀█ ░█ ░█  ░█   ░█▄▄▄█ ░█ ░█
+  
+      
+        """)
 
 for folder in input_data_folders:
 
-    logger.info(f"Processing folder: {folder}")
-
     if  'all' in input_jobs:
 
-        logger.info("Running all DQ checks jobs: format -> mapping_gap -> mapping_report")
         run_formatters_jobs(folder)
         run_mapping_gap_jobs(folder)
         run_mapping_report_job(folder)
@@ -919,20 +960,15 @@ for folder in input_data_folders:
         if  'mapping_report' in input_jobs:
             logger.info("Starting MAPPING_REPORT job")
             run_mapping_report_job(folder)
-        
-    logger.info(f"Completed processing folder: {folder}")
-
-    
-
-logger.info("=" * 60)
-logger.info("DQ Checks Pipeline completed successfully")
-logger.info("=" * 60)
 
 print("""
+      
 
                                                     ▀▀█▀▀ ░█ ░█ ░█▀▀▀ 　 ░█▀▀▀ ░█▄ ░█ ░█▀▀▄ 　 █ 
                                                      ░█   ░█▀▀█ ░█▀▀▀ 　 ░█▀▀▀ ░█░█░█ ░█ ░█ 　 ▀ 
                                                      ░█   ░█ ░█ ░█▄▄▄ 　 ░█▄▄▄ ░█  ▀█ ░█▄▄▀ 　 ▄
             
-    """)
+    
+      """)
+             
              

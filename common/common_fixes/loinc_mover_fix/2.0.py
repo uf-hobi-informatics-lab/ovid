@@ -198,7 +198,7 @@ try:
     lab_result_cm_path = f'/app/partners/{input_partner_name}/data/{input_data_folder}/fixer_output/fixed_lab_result_cm.csv'
     obs_clin_path = f'/app/partners/{input_partner_name}/data/{input_data_folder}/fixer_output/fixed_obs_clin.csv'
     obs_gen_path = f'/app/partners/{input_partner_name}/data/{input_data_folder}/fixer_output/fixed_obs_gen.csv'
-    loinc_code_location_path = f'/app/common/cdm/loinc_code_location.csv'
+    loinc_code_location_path = f'/app/common/cdm/pcornet_7_0/loinc_code_location.csv'
 
     loinc_code_location            = cf.spark_read(loinc_code_location_path, spark)
 

@@ -10,19 +10,22 @@ import argparse
 from datetime import datetime
 import pytz
 from settings import  VALID_ETL_JOBS
-from ovid_logging import setup_logging, get_logger, log_job_start, log_job_end, log_table_processing
+from ovid_logging import setup_logging, get_logger, log_job_start, log_job_end, log_table_processing, print_pipeline_summary
 
 from PIL import Image
+
+# Ensure /app/common is on PYTHONPATH for all subprocesses.
+# spark-submit --py-files distributes common.zip via temp dirs that may be
+# cleaned up after spark.stop(), breaking imports in child processes.
+_pypath = os.environ.get('PYTHONPATH', '')
+if '/app/common' not in _pypath:
+    os.environ['PYTHONPATH'] = '/app/common' + (':' + _pypath if _pypath else '')
 
 master_url = os.environ["SPARK_URL"].strip().replace('"', '')
 
 # Extract timestamp from master URL (format: spark://ovid-master-YYYYMMDD-HHMMSS:7077)
 master_name = master_url.replace('spark://', '').replace(':7077', '')
 timestamp = master_name.replace('ovid-master-', '')
-
-print('*********************************************************************')
-print(master_url)
-print('*********************************************************************')
 
 
 spark = SparkSession.builder.master(master_url).appName("Ovid").getOrCreate()
@@ -32,9 +35,6 @@ spark = SparkSession.builder.master(master_url).appName("Ovid").getOrCreate()
 spark.sparkContext.setLogLevel('OFF')
 spark.stop()
 
-print("PYTHONPATH:", sys.path)
-                                    
- 
 
 job_num = 0
 
@@ -74,11 +74,31 @@ input_upload_type = args.upload_type
 input_merge_db = args.merge_database
 input_merge_schema = args.merge_schema
 
+# Print startup summary
+print_pipeline_summary("OVID ETL Pipeline", [
+    ("Partner",     input_partner),
+    ("Folder(s)",   ', '.join(input_data_folders) if input_data_folders else 'N/A'),
+    ("Stages",      ', '.join(input_jobs) if input_jobs else 'N/A'),
+    ("Tables",      ', '.join(input_tables) if input_tables else 'N/A'),
+    ("Database",    input_db or 'N/A'),
+    ("DB Type",     input_db_type or 'N/A'),
+    ("DB Server",   input_db_server or 'N/A'),
+    ("Upload Type", input_upload_type or 'N/A'),
+    ("Instance",    timestamp),
+])
+# Flush stdout immediately so the banner reaches the host-side log streamer
+# even when the parent harness (opencode/ansible/CI) buffers or terminates
+# stdout before the live-display thread connects.
+sys.stdout.flush()
+
 # Initialize logging with timestamp and partner
 logger = setup_logging(timestamp=timestamp, partner=input_partner)
 logger.info(f"ETL Pipeline started - Partner: {input_partner}, Jobs: {input_jobs}, Tables: {input_tables}")
 
 
+# Clear stale failure queue and flag from previous runs to prevent
+# old failure messages from being displayed in this run
+cf.clear_stale_sync_files()
 
 
 # cf =CommonFuncitons(input_partner)
@@ -86,16 +106,6 @@ logger.info(f"ETL Pipeline started - Partner: {input_partner}, Jobs: {input_jobs
 logger.info("=" * 60)
 logger.info("Starting ETL job execution")
 logger.info("=" * 60)
-
-print("""
-
-                            ▄█  ░█▀▀▀ ░█       ░█▀▀█ ░█ ░█  █▀▀█ ░█▄ ░█ ░█▀▀█ ░█▀▀▀ ▀█▀ ░█▄ ░█  █▀▀█ ▀▀█▀▀ ░█▀▀▀█ ░█▀▀█ 
-                             █  ░█▀▀▀ ░█    ▀▀ ░█    ░█▀▀█ ░█▄▄█ ░█░█░█ ░█ ▄▄ ░█▀▀▀ ░█  ░█░█░█ ░█▄▄█  ░█   ░█  ░█ ░█▄▄▀ 
-                            ▄█▄ ░█    ░█▄▄█    ░█▄▄█ ░█ ░█ ░█ ░█ ░█  ▀█ ░█▄▄█ ░█▄▄▄ ▄█▄ ░█  ▀█ ░█ ░█  ░█   ░█▄▄▄█ ░█ ░█
-
-                                                                                                                                                            
-                                                                              """
-                                                   )
 
 ###################################################################################################################################
 # This function will get all the created formatter python script and return a list of thier names
@@ -198,13 +208,36 @@ def run_formatter(partner, formatter, folder):
     global job_num
 
     job_num = job_num +1
-    cf.print_run_status(job_num,total_jobs_count,formatter, folder, partner)
-
-    # command = ["python", "/app/partners/"+partner+"/formatting_scripts/"+formatter, '-f', folder , '' ]
+    
+    # Set work directory for sync files
+    import os
+    work_dir = f"/app/partners/{partner}/data/{folder}"
+    
+    # Print status with subprocess_mode=True to avoid race condition
+    cf.print_run_status(job_num, total_jobs_count, formatter, folder, partner, subprocess_mode=True)
+    
+    # Set up sync files (subprocess_running is already True from print_run_status)
+    cf.pause_timer_for_subprocess(work_dir=work_dir)
 
     command = ["python", "/app/partners/"+partner+"/formatting_scripts/"+formatter, '-f', folder , '-p', partner  ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+    if cf._overall_start_time:
+        env['OVID_OVERALL_START_TIME'] = cf._overall_start_time.isoformat()
+    env['OVID_WORK_DIR'] = work_dir
+    # Ensure /app/common is on PYTHONPATH so subprocesses can import commonFunctions
+    # (spark-submit --py-files only adds common.zip to the driver's sys.path;
+    #  the temp copy may be cleaned up by spark.stop() before subprocesses run)
+    existing_pypath = env.get('PYTHONPATH', '')
+    if '/app/common' not in existing_pypath:
+        env['PYTHONPATH'] = '/app/common' + (':' + existing_pypath if existing_pypath else '')
+    
+    # Execute the command (output captured to log, not terminal)
+    cf.run_subprocess(command, env=env)
+    
+    # Resume the timer after formatter subprocess completes
+    cf.resume_timer_after_subprocess()
 
 
 
@@ -217,12 +250,34 @@ def run_fixer(partner, fixer, folder):
     global job_num
 
     job_num = job_num +1
-    cf.print_run_status(job_num,total_jobs_count,fixer, folder, partner)
+    
+    # Set work directory for sync files
+    import os
+    work_dir = f"/app/partners/{partner}/data/{folder}"
+    
+    # Print status with subprocess_mode=True to avoid race condition
+    cf.print_run_status(job_num, total_jobs_count, fixer, folder, partner, subprocess_mode=True)
+    
+    # Set up sync files (subprocess_running is already True from print_run_status)
+    cf.pause_timer_for_subprocess(work_dir=work_dir)
 
-
-    command = ["python", "/app/partners/"+partner+"/fixer_scripts/"+fixer, '-f', folder  ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    command = ["python", "/app/partners/"+partner+"/fixer_scripts/"+fixer, '-f', folder]
+    
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+    if cf._overall_start_time:
+        env['OVID_OVERALL_START_TIME'] = cf._overall_start_time.isoformat()
+    env['OVID_WORK_DIR'] = work_dir
+    # Ensure /app/common is on PYTHONPATH so subprocesses can import commonFunctions
+    existing_pypath = env.get('PYTHONPATH', '')
+    if '/app/common' not in existing_pypath:
+        env['PYTHONPATH'] = '/app/common' + (':' + existing_pypath if existing_pypath else '')
+    
+    # Execute the command (output captured to log, not terminal)
+    cf.run_subprocess(command, env=env)
+    
+    # Resume the timer after fixer subprocess completes
+    cf.resume_timer_after_subprocess()
 
 ###################################################################################################################################
 # This function will run the deduplicator script for a single table
@@ -242,8 +297,8 @@ def run_deduplicator(partner, input_folder, output_folder):
         # add table list
         command.append(table)
 
-        # Execute the command
-        subprocess.run(" ".join(command), shell=True)
+        # Execute the command (output captured to log, not terminal)
+        cf.run_subprocess(" ".join(command), shell=True)
 ###################################################################################################################################
 # This function will run the deduplicator script for a single table
 ###################################################################################################################################
@@ -262,8 +317,8 @@ def run_deduplicator(partner, input_folder, output_folder):
         # add table list
         command.append(table)
 
-        # Execute the command
-        subprocess.run(" ".join(command), shell=True)
+        # Execute the command (output captured to log, not terminal)
+        cf.run_subprocess(" ".join(command), shell=True)
 
 ###################################################################################################################################
 # This function will run the mapper script for a single table
@@ -274,15 +329,36 @@ def run_mapper(partner, mapper, folder):
 
     job_num = job_num +1
 
+    # Set work directory for sync files
+    import os
+    work_dir = f"/app/partners/{partner}/data/{folder}"
 
     partner_settings_path = "partners."+partner+".partner_settings"
     partner_settings = importlib.import_module(partner_settings_path)
 
-    cf.print_run_status(job_num,total_jobs_count, mapper, folder, partner)
+    # Print status with subprocess_mode=True to avoid race condition
+    cf.print_run_status(job_num, total_jobs_count, mapper, folder, partner, subprocess_mode=True)
+    
+    # Set up sync files (subprocess_running is already True from print_run_status)
+    cf.pause_timer_for_subprocess(work_dir=work_dir)
 
     command = ["python", "/app/mapping_scripts/"+partner_settings.mappers_type+"/"+mapper,"-p",partner, '-f', folder ]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+    if cf._overall_start_time:
+        env['OVID_OVERALL_START_TIME'] = cf._overall_start_time.isoformat()
+    env['OVID_WORK_DIR'] = work_dir
+    # Ensure /app/common is on PYTHONPATH so subprocesses can import commonFunctions
+    existing_pypath = env.get('PYTHONPATH', '')
+    if '/app/common' not in existing_pypath:
+        env['PYTHONPATH'] = '/app/common' + (':' + existing_pypath if existing_pypath else '')
+    
+    # Execute the command (output captured to log, not terminal)
+    cf.run_subprocess(command, env=env)
+    
+    # Resume the timer after mapper subprocess completes
+    cf.resume_timer_after_subprocess()
 
     
 
@@ -378,12 +454,34 @@ def run_dc_check(partner, dc_check, folder):
     global job_num
 
     job_num = job_num +1
-    cf.print_run_status(job_num,total_jobs_count,dc_check, folder, partner)
-
+    
+    # Set work directory for sync files
+    import os
+    work_dir = f"/app/partners/{partner}/data/{folder}"
+    
+    # Print status with subprocess_mode=True to avoid race condition
+    cf.print_run_status(job_num, total_jobs_count, dc_check, folder, partner, subprocess_mode=True)
+    
+    # Set up sync files (subprocess_running is already True from print_run_status)
+    cf.pause_timer_for_subprocess(work_dir=work_dir)
 
     command = ["python", "/app/dc_checks_scripts/"+dc_check+'.py', '-f', folder , '-p', partner]
-    # Execute the command
-    subprocess.run(" ".join(command), shell=True)
+    
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+    if cf._overall_start_time:
+        env['OVID_OVERALL_START_TIME'] = cf._overall_start_time.isoformat()
+    env['OVID_WORK_DIR'] = work_dir
+    # Ensure /app/common is on PYTHONPATH so subprocesses can import commonFunctions
+    existing_pypath = env.get('PYTHONPATH', '')
+    if '/app/common' not in existing_pypath:
+        env['PYTHONPATH'] = '/app/common' + (':' + existing_pypath if existing_pypath else '')
+    
+    # Execute the command (output captured to log, not terminal)
+    cf.run_subprocess(command, env=env)
+    
+    # Resume the timer after dc_check subprocess completes
+    cf.resume_timer_after_subprocess()
 
 ###################################################################################################################################
 # This function will run the deduplicators script
@@ -608,14 +706,19 @@ def run_upload_jobs(folder):
 
             partner_uploads_list = get_partner_uploads_list(fixed_files_path)
 
-            
+            if len(partner_uploads_list) == 0:
+                logger.warning(f"No fixed_*.csv files found in {fixed_files_path} - nothing to upload!")
+                print(f"WARNING: No fixed_*.csv files found in {fixed_files_path}")
+                print("Please ensure the fix job has been run before upload.")
 
             for file_name  in partner_uploads_list:
 
                 table_name = file_name.replace('fixed_',"").replace('.csv',"")
 
                 job_num = job_num +1
-                cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{folder.upper()}.{table_name.upper()}", folder, input_partner)
+                # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                schema_date = folder.split('/')[-1] if '/' in folder else folder
+                cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table_name.upper()}", folder, input_partner)
 
 
                 # schemas = cf.get_schemas( table_name.upper(), fixed_files_path)
@@ -630,6 +733,7 @@ def run_upload_jobs(folder):
                             upload_type = input_upload_type,
                             merge_db = input_merge_db,
                             merge_schema = input_merge_schema,
+                            partner_name = input_partner,
                             )
 
             cf.print_run_status(job_num,total_jobs_count, f"uploading CDM complementary tables", folder, input_partner)
@@ -643,9 +747,16 @@ def run_upload_jobs(folder):
                                         db_server=input_db_server,
                                         folder_name = folder,
                                         db_type = input_db_type,
-                                        mappers_type =mappers_type
+                                        mappers_type =mappers_type,
+                                        upload_type = input_upload_type,
+                                        merge_db = input_merge_db,
+                                        merge_schema = input_merge_schema
                                         )
         else:
+
+            uploaded_count = 0
+            skipped_count = 0
+            skipped_tables = []
 
             for table in input_tables:
                 fixed_table_name = "fixed_"+table.lower()+".csv"
@@ -657,7 +768,9 @@ def run_upload_jobs(folder):
                     if os.path.exists(fixed_files_path+fixed_table_name):
 
                         job_num = job_num +1
-                        cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{folder.upper()}.{table.upper()}", folder, input_partner)
+                        # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                        schema_date = folder.split('/')[-1] if '/' in folder else folder
+                        cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table.upper()}", folder, input_partner)
 
 
                         # schemas = cf.get_schemas(table.upper(),fixed_files_path)
@@ -674,20 +787,21 @@ def run_upload_jobs(folder):
                                     upload_type = input_upload_type,
                                     merge_db = input_merge_db,
                                     merge_schema = input_merge_schema,
+                                    partner_name = input_partner,
+                            
                                     )
-                        
+                        uploaded_count += 1
 
                     else:
-
+                            skipped_count += 1
+                            skipped_tables.append(table)
+                            logger.warning(f"Upload skipped for table '{table}': file {fixed_table_name} not found at {fixed_files_path}")
                             cf.print_failure_message(
                                                     folder  = folder,
                                                     partner = input_partner,
                                                     job     = 'upload '+ table.lower()  ,
                                                     text    =  f"{fixed_table_name} Path does not exist!!!!"
                                                     )
-
-
-
 
 
                 else:
@@ -700,8 +814,18 @@ def run_upload_jobs(folder):
                                         db_server=input_db_server,
                                         folder_name = folder,
                                         db_type = input_db_type,
-                                        mappers_type =mappers_type
+                                        mappers_type =mappers_type,
+                                        upload_type = input_upload_type,
+                                        merge_db = input_merge_db,
+                                        merge_schema = input_merge_schema
                                         )
+
+            if skipped_count > 0:
+                logger.warning(f"Upload summary: {uploaded_count} tables uploaded, {skipped_count} tables skipped: {skipped_tables}")
+                print(f"\nWARNING: {skipped_count} out of {len(input_tables)} tables were skipped because fixed files were not found.")
+                print(f"Skipped tables: {', '.join(skipped_tables)}")
+                print(f"Expected path: {fixed_files_path}")
+                print("Please ensure the fix job has been run for these tables before upload.\n")
 
 
 
@@ -728,7 +852,7 @@ for job in input_jobs:
         sys.exit()
 
 
-if 'format' in input_jobs or 'all' in input_jobs:
+if 'format' in input_jobs or 'all' in input_jobs or 'upload' in input_jobs:
 
     if input_data_folders == "" or input_data_folders == None:
 
@@ -751,6 +875,15 @@ if 'format' in input_jobs or 'all' in input_jobs:
                 print("Path  "+path+" does not exits !!!!!!!")
                 sys.exit()
 
+            # Validate fixer_output path exists when running upload standalone (without fix or earlier stages)
+            if 'upload' in input_jobs and 'fix' not in input_jobs and 'all' not in input_jobs:
+                fixer_output_path = '/app/partners/'+input_partner.lower()+'/data/'+folder+'/fixer_output/'
+                if not os.path.exists(fixer_output_path):
+                    logger.error(f"Fixer output path does not exist: {fixer_output_path}")
+                    print(f"Error: fixer_output directory does not exist at {fixer_output_path}")
+                    print("Please run the fix job before upload, or verify the data path.")
+                    sys.exit()
+
 
 
 ###################################################################################################################################
@@ -763,7 +896,7 @@ folders_count = len(input_data_folders)
 
 
 if 'all' in  input_jobs:
-    jobs_count = 4
+    jobs_count = 5  # format, deduplicate, map, fix, upload
 else:
     jobs_count = len(input_jobs)
 
@@ -774,9 +907,9 @@ try:
     else:
         tables_count = len(input_tables)
 except:
-    pass
+    tables_count = 1
 
-total_jobs_count = '**' #folders_count * jobs_count * tables_count
+total_jobs_count = folders_count * jobs_count * tables_count
 
 
 ###################################################################################################################################
@@ -915,62 +1048,138 @@ def run_distinct_values_jobs(folder):
 ###################################################################################################################################
 # submitting the jobs to be run
 ###################################################################################################################################
- 
+
+# Track whether any phase raised a Python exception that escaped the
+# helpers' own try/except blocks. Combined with cf._check_failure_flag()
+# (set by print_failure_message() when a subprocess writes a failure
+# message), this lets us decide the parent script's exit code at the
+# end -- so the scheduler's `result.returncode` correctly reflects
+# whether the batch actually completed end-to-end.
+#
+# Why this exists: the EMY 20260610 batch demonstrated a class of
+# silent-PROCESSED bugs. Helpers like cf.deduplicate() catch
+# exceptions internally (commonFunctions.py:867) and call
+# print_with_style(...) which writes only to the terminal -- the
+# parent ETL pipeline keeps looping through dedup/map/fix/upload
+# even though every call is failing. Without this guard the parent
+# exits with returncode 0 and the scheduler marks the batch
+# PROCESSED in OVID.SCHEDULER.data_batch -- a false positive that
+# misleads operators about whether the data actually landed.
+_etl_pipeline_had_uncaught_exception = False
 
 for folder in input_data_folders:
+    try:
+        if  'all' in input_jobs:
+            logger.info(f"Processing folder: {folder}")
+            logger.info("Running all ETL jobs: format -> deduplicate -> map -> fix -> upload")
 
-    logger.info(f"Processing folder: {folder}")
+            print("""
+      
 
-    if  'all' in input_jobs:
+                            ▄█  ░█▀▀▀ ░█       ░█▀▀█ ░█ ░█  █▀▀█ ░█▄ ░█ ░█▀▀█ ░█▀▀▀ ▀█▀ ░█▄ ░█  █▀▀█ ▀▀█▀▀ ░█▀▀▀█ ░█▀▀█
+                             █  ░█▀▀▀ ░█    ▀▀ ░█    ░█▀▀█ ░█▄▄█ ░█░█░█ ░█ ▄▄ ░█▀▀▀ ░█  ░█░█░█ ░█▄▄█  ░█   ░█  ░█ ░█▄▄▀
+                            ▄█▄ ░█    ░█▄▄█    ░█▄▄█ ░█ ░█ ░█ ░█ ░█  ▀█ ░█▄▄█ ░█▄▄▄ ▄█▄ ░█  ▀█ ░█ ░█  ░█   ░█▄▄▄█ ░█ ░█
+  
+      
+            """)
 
-        logger.info("Running all ETL jobs: format -> deduplicate -> map -> fix -> upload")
-        run_formatters_jobs(folder)
-        run_deduplicator_jobs(folder)
-        run_mappers_jobs(folder)
-        run_fixers_jobs(folder)
-        run_upload_jobs(folder)
-
-    else :
-
-
-        if  'format' in input_jobs:
-            logger.info("Starting FORMAT job")
-            run_formatters_jobs(folder)     
-
-        if  'deduplicate' in input_jobs:
-            logger.info("Starting DEDUPLICATE job")
+            run_formatters_jobs(folder)
             run_deduplicator_jobs(folder)
-
-        if  'map' in input_jobs:
-            logger.info("Starting MAP job")
             run_mappers_jobs(folder)
-
-        if  'fix' in input_jobs:
-            logger.info("Starting FIX job")
             run_fixers_jobs(folder)
-
-
-        if  'upload' in input_jobs:
-            logger.info("Starting UPLOAD job")
             run_upload_jobs(folder)
 
+        else :
 
-    logger.info(f"Completed processing folder: {folder}")
+            logger.info(f"Processing folder: {folder}")
 
+            if  'format' in input_jobs:
+                logger.info("Starting FORMAT job")
+            if  'deduplicate' in input_jobs:
+                logger.info("Starting DEDUPLICATE job")
+            if  'map' in input_jobs:
+                logger.info("Starting MAP job")
+            if  'fix' in input_jobs:
+                logger.info("Starting FIX job")
+            if  'upload' in input_jobs:
+                logger.info("Starting UPLOAD job")
 
-        
+            print("""
+      
 
-    
+                            ▄█  ░█▀▀▀ ░█       ░█▀▀█ ░█ ░█  █▀▀█ ░█▄ ░█ ░█▀▀█ ░█▀▀▀ ▀█▀ ░█▄ ░█  █▀▀█ ▀▀█▀▀ ░█▀▀▀█ ░█▀▀█
+                             █  ░█▀▀▀ ░█    ▀▀ ░█    ░█▀▀█ ░█▄▄█ ░█░█░█ ░█ ▄▄ ░█▀▀▀ ░█  ░█░█░█ ░█▄▄█  ░█   ░█  ░█ ░█▄▄▀
+                            ▄█▄ ░█    ░█▄▄█    ░█▄▄█ ░█ ░█ ░█ ░█ ░█  ▀█ ░█▄▄█ ░█▄▄▄ ▄█▄ ░█  ▀█ ░█ ░█  ░█   ░█▄▄▄█ ░█ ░█
+  
+      
+            """)
 
-logger.info("=" * 60)
-logger.info("ETL Pipeline completed successfully")
-logger.info("=" * 60)
+            if  'format' in input_jobs:
+                run_formatters_jobs(folder)     
+
+            if  'deduplicate' in input_jobs:
+                run_deduplicator_jobs(folder)
+
+            if  'map' in input_jobs:
+                run_mappers_jobs(folder)
+
+            if  'fix' in input_jobs:
+                run_fixers_jobs(folder)
+
+            if  'upload' in input_jobs:
+                run_upload_jobs(folder)
+
+    except Exception as _folder_exc:
+        # An uncaught exception escaped one of the run_*_jobs() helpers
+        # for this folder. Log full traceback and remember to fail the
+        # parent process at exit -- but keep iterating remaining folders
+        # so the operator gets partial-success visibility on multi-folder
+        # batches. The scheduler always passes one folder per batch, so
+        # in practice this fires for the only folder of the run.
+        _etl_pipeline_had_uncaught_exception = True
+        logger.error(
+            f"Uncaught exception while processing folder {folder}: {_folder_exc}",
+            exc_info=True,
+        )
+
 
 print("""
+      
 
                                                     ▀▀█▀▀ ░█ ░█ ░█▀▀▀ 　 ░█▀▀▀ ░█▄ ░█ ░█▀▀▄ 　 █ 
                                                      ░█   ░█▀▀█ ░█▀▀▀ 　 ░█▀▀▀ ░█░█░█ ░█ ░█ 　 ▀ 
                                                      ░█   ░█ ░█ ░█▄▄▄ 　 ░█▄▄▄ ░█  ▀█ ░█▄▄▀ 　 ▄
             
-    """)
+    
+      """)
+
+# Decide the parent process exit code so the scheduler's
+# `result.returncode` correctly reflects whether the batch actually
+# completed end-to-end. Two distinct signals:
+#   1. _etl_pipeline_had_uncaught_exception -- something escaped the
+#      run_*_jobs() helpers' own try/except blocks (folder-level).
+#   2. cf._check_failure_flag() -- a subprocess (formatter/fixer/mapper)
+#      wrote a failure message to the queue, OR print_failure_message()
+#      was invoked anywhere in the parent. This flag was already being
+#      set in many places but never consulted at exit -- the EMY
+#      20260610 batch is the canonical example: 4 formatters failed,
+#      the dedup phase silently failed for every table, and the parent
+#      still exited 0 because nothing checked the flag.
+_pipeline_failed = _etl_pipeline_had_uncaught_exception
+try:
+    if cf._check_failure_flag():
+        _pipeline_failed = True
+except Exception as _flag_exc:
+    logger.warning(
+        f"Could not check failure flag at pipeline exit: {_flag_exc}",
+        exc_info=True,
+    )
+
+if _pipeline_failed:
+    logger.error(
+        "ETL pipeline finished with one or more job failures. "
+        "Exiting with non-zero status so the caller (scheduler or CLI) "
+        "marks this batch as ERROR."
+    )
+    sys.exit(1)
              

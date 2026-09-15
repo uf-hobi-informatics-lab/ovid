@@ -571,15 +571,20 @@ class OvidFunctions:
                         "transform-tokens",
                         "--to", "pcornet",
                         "--from", datavant_key,
-                        "-s", "oneflorida_crn",
+                        "-s", DATAVANT_SITE,
                         "-i", input_file_path + file_name,
                         "-o", datavant_working_directory
                     ],
                     stdin=cred_file,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+                    stderr=subprocess.PIPE,
+                    cwd=datavant_working_directory
                 )
                 stdout, stderr = process.communicate()
+                if stdout:
+                    print(stdout.decode())
+                if stderr:
+                    print(stderr.decode())
 
 ###################################################################################################################################
 # This function will 
@@ -1019,6 +1024,11 @@ class OvidFunctions:
         spark = SparkSession.builder \
                         .master("spark://master:7077") \
                         .appName("Upload") \
+                        .config("spark.task.maxFailures", "8") \
+                        .config("spark.stage.maxConsecutiveAttempts", "8") \
+                        .config("spark.excludeOnFailure.enabled", "true") \
+                        .config("spark.excludeOnFailure.task.maxTaskAttemptsPerExecutor", "2") \
+                        .config("spark.excludeOnFailure.task.maxTaskAttemptsPerNode", "4") \
                         .getOrCreate()  
 
 
@@ -1082,15 +1092,15 @@ class OvidFunctions:
                 "pem_private_key": pkb  # <== path to your .p8 private key
             }
 
-            # Write DataFrame to Snowflake
-            empty_df.write \
-                .format(SNOWFLAKE_SOURCE_NAME) \
-                .options(**sf_options) \
-                .option("dbtable", table.upper()) \
-                .option("createTableColumnTypes", schema) \
-                .option("useSchema", f"OVID_{folder_name}") \
-                .mode("ignore") \
-                .save()
+            # Write DataFrame to Snowflake with retry logic
+            cls._snowflake_write_with_retry_simple(
+                df=empty_df,
+                sf_options=sf_options,
+                table_name=table,
+                schema=schema,
+                schema_name=f"OVID_{folder_name}",
+                mode="ignore"
+            )
             
 
                     
@@ -1116,6 +1126,11 @@ class OvidFunctions:
             spark = SparkSession.builder \
                 .master("spark://master:7077") \
                 .appName("Upload") \
+                .config("spark.task.maxFailures", "8") \
+                .config("spark.stage.maxConsecutiveAttempts", "8") \
+                .config("spark.excludeOnFailure.enabled", "true") \
+                .config("spark.excludeOnFailure.task.maxTaskAttemptsPerExecutor", "2") \
+                .config("spark.excludeOnFailure.task.maxTaskAttemptsPerNode", "4") \
                 .getOrCreate()            
 
             custom_schema = StructType(schema)
@@ -1143,15 +1158,15 @@ class OvidFunctions:
                 "pem_private_key": pkb  # <== path to your .p8 private key
             }
             
-            # Write DataFrame to Snowflake
-            file_df.repartition(10).write \
-                .format(SNOWFLAKE_SOURCE_NAME) \
-                .options(**sf_options) \
-                .option("dbtable", table_name.upper()) \
-                .option("createTableColumnTypes", schema) \
-                .option("useSchema", f"OVID_{folder_name}") \
-                .mode("overwrite") \
-                .save()
+            # Write DataFrame to Snowflake with retry logic
+            cls._snowflake_write_with_retry(
+                df=file_df,
+                sf_options=sf_options,
+                table_name=table_name,
+                schema=schema,
+                db_schema_name=f"OVID_{folder_name}",
+                mode="overwrite"
+            )
             
             spark.stop()
                 
@@ -1466,8 +1481,91 @@ class OvidFunctions:
 
 
 ###################################################################################################################################
-# This function will return a list of folder in a given path
+# This function will upload a pyspark df to mssql table in a specified server/dabase
 ###################################################################################################################################
+
+    @classmethod
+    def _snowflake_write_with_retry(cls, df, sf_options, table_name, schema, db_schema_name, mode="overwrite", max_retries=3, base_delay=30):
+        """
+        Internal helper to write DataFrame to Snowflake with retry logic.
+        Handles transient network failures like DNS resolution errors.
+        """
+        SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+        retries = 0
+        last_exception = None
+        
+        while retries <= max_retries:
+            try:
+                df.repartition(10).write \
+                    .format(SNOWFLAKE_SOURCE_NAME) \
+                    .options(**sf_options) \
+                    .option("dbtable", table_name.upper()) \
+                    .option("createTableColumnTypes", schema) \
+                    .option("useSchema", db_schema_name) \
+                    .mode(mode) \
+                    .save()
+                return  # Success - exit the function
+            except Exception as e:
+                last_exception = e
+                error_str = str(e).lower()
+                # Only retry on transient network errors
+                if any(err in error_str for err in ['unknownhostexception', 'sockettimeoutexception', 
+                                                      'connectionreset', 'connection reset', 
+                                                      'networkunreachable', 'temporaryerror']):
+                    retries += 1
+                    if retries > max_retries:
+                        print(f"[RETRY] All {max_retries} retry attempts failed for Snowflake upload of {table_name}")
+                        raise
+                    delay = min(base_delay * (2 ** (retries - 1)), 300)
+                    print(f"[RETRY] Attempt {retries}/{max_retries} failed with transient error: {str(e)[:200]}")
+                    print(f"[RETRY] Retrying Snowflake upload for {table_name} in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    # Non-transient error - don't retry
+                    raise
+        raise last_exception
+
+    @classmethod
+    def _snowflake_write_with_retry_simple(cls, df, sf_options, table_name, schema, schema_name, mode="ignore", max_retries=3, base_delay=30):
+        """
+        Internal helper to write DataFrame to Snowflake with retry logic (simple version).
+        Used for creating empty tables with ignore mode.
+        """
+        SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+        retries = 0
+        last_exception = None
+        
+        while retries <= max_retries:
+            try:
+                df.write \
+                    .format(SNOWFLAKE_SOURCE_NAME) \
+                    .options(**sf_options) \
+                    .option("dbtable", table_name.upper()) \
+                    .option("createTableColumnTypes", schema) \
+                    .option("useSchema", schema_name) \
+                    .mode(mode) \
+                    .save()
+                return  # Success - exit the function
+            except Exception as e:
+                last_exception = e
+                error_str = str(e).lower()
+                # Only retry on transient network errors
+                if any(err in error_str for err in ['unknownhostexception', 'sockettimeoutexception', 
+                                                      'connectionreset', 'connection reset', 
+                                                      'networkunreachable', 'temporaryerror']):
+                    retries += 1
+                    if retries > max_retries:
+                        print(f"[RETRY] All {max_retries} retry attempts failed for Snowflake upload of {table_name}")
+                        raise
+                    delay = min(base_delay * (2 ** (retries - 1)), 300)
+                    print(f"[RETRY] Attempt {retries}/{max_retries} failed with transient error: {str(e)[:200]}")
+                    print(f"[RETRY] Retrying Snowflake upload for {table_name} in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    # Non-transient error - don't retry
+                    raise
+        raise last_exception
+
     @classmethod
     def get_folders_list(cls, path):
 

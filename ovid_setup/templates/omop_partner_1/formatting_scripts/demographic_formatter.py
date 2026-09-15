@@ -70,25 +70,6 @@ try:
     convert_and_format_time_udf = udf(get_time_from_datetime, StringType())   
 
         ###################################################################################################################################
-    """    def get_most_recent_zipcode(person, address):
-                # Join person and address dataframes on person_id
-                joined_df = person.join(address, person.person_id == address.person_id, "inner")
-
-                # Group by person_id and find the row with the maximum start_date for each group
-                result_df = joined_df.groupBy("person_id").agg(
-                F.max("start_date").alias("most_recent_start_date"),
-                F.first("ZIP_CODE").alias("most_recent_zip")  # Assuming ZIP_CODE is the same for each person_id in the group
-                )
-
-                # Collect the result as a list of dictionaries
-                result_list = result_df.collect()
-
-                # Convert the result list to a dictionary mapping person_id to the most recent ZIP_CODE
-                result_dict = {row["person_id"]: row["most_recent_zip"] for row in result_list}
-
-                return result_dict"""
-            
-        
 
         ###################################################################################################################################
 
@@ -110,8 +91,7 @@ try:
                                                         lit("").alias("RAW_GENDER_IDENTITY"),
                                                         person['ethnicity_source_value'].alias("RAW_HISPANIC"),
                                                         person['race_source_value'].alias("RAW_RACE"),
-                                                        person['spoken_language_source_value'].alias("RAW_PAT_PREF_LANGUAGE_SPOKEN"),
-                                                        lit("").alias("ZIP_CODE")
+                                                        person['spoken_language_source_value'].alias("RAW_PAT_PREF_LANGUAGE_SPOKEN")
 
 
 
