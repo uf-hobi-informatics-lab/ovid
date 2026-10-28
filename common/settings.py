@@ -14,6 +14,16 @@ DEFAULT_DRIVER_MEMORY_OVERHEAD   = '2g'    # Spark driver memory overhead for th
 DEFAULT_EXECUTOR_MEMORY_OVERHEAD = '4g'    # Spark executor memory overhead for worker tasks
 DEFAULT_SUBPROCESS_DRIVER_MEMORY = '4g'    # Spark driver memory for fix/formatter/mapper subprocesses
 
+# Executor JVM heap for the subprocess SparkSessions built by
+# CommonFuncitons.get_spark_session(). Must stay <= the worker's
+# SPARK_WORKER_MEMORY (set in ovid.py) or the standalone master can never
+# place an executor. Spark's 1g default heap is too small for large tables.
+DEFAULT_SUBPROCESS_EXECUTOR_MEMORY = '6g'
+
+# JVM thread stack size for executors and subprocess drivers. Deep Catalyst
+# plans / codegen on wide OMOP tables overflowed the 1 MB default stack.
+DEFAULT_SPARK_THREAD_STACK_SIZE = '16m'
+
 ###################################################################################################################################
 # Spark SQL / serialization tuning applied to every subprocess SparkSession
 # (formatter / deduplicator / mapper / fixer / upload) built by
@@ -46,6 +56,28 @@ DEFAULT_DB_SERVER       = ''
 AWK_PASSBY_TRESHHOLD = 40000000 # Tables more than 40M rows will not run on awk deduplicte
 
 ###################################################################################################################################
+# Fixer-stage output and fix-chain tuning
+###################################################################################################################################
+
+# Threads used by CommonFuncitons.write_pyspark_output_file() to concatenate
+# Spark part files into the single output CSV (replaces single-threaded awk).
+FIXED_FILE_MERGE_MAX_WORKERS = 16
+
+# Suffix of the in-progress merged file; renamed onto the final name only on success.
+PARTIAL_OUTPUT_SUFFIX = '.partial'
+
+# When True, partner fixers that call cf.apply_fix_chain() run all supported
+# common fixes for a table in ONE Spark session: the mapped table is read once,
+# each fix is a DataFrame transformation, the intermediate state is checkpointed
+# to Parquet only where needed, and the fixed table is written once. Set to
+# False to fall back to the legacy one-subprocess-per-fix path (apply_fix).
+FIX_CHAIN_MODE = True
+
+# Spark-written columnar intermediate used by the fix chain between fixes.
+FIX_CHAIN_CHECKPOINT_FORMAT = 'parquet'
+FIX_CHAIN_CHECKPOINT_COMPRESSION = 'zstd'
+
+###################################################################################################################################
 ###################################################################################################################################
 
 # Chunked parallel Datavant token-transform tuning (hash_token formatting).
@@ -55,7 +87,22 @@ AWK_PASSBY_TRESHHOLD = 40000000 # Tables more than 40M rows will not run on awk 
 #
 # HASH_TOKEN_MAX_CHUNKS caps per-partner concurrency. Worst case across the
 # scheduler is SCHEDULER_PARALLEL_SLOTS * HASH_TOKEN_MAX_CHUNKS concurrent
-# Datavant subprocesses (3 * 16 = 48 on the 96-core host), leaving headroom
+# Datavant subprocesses, leaving headroom
+# for the per-slot Spark clusters and disk I/O.
+HASH_TOKEN_CHUNK_SIZE_TARGET = 50 * 1024 * 1024  # 50 MB target per Datavant chunk
+HASH_TOKEN_MAX_CHUNKS        = 16
+
+###################################################################################################################################
+###################################################################################################################################
+
+# Chunked parallel Datavant token-transform tuning (hash_token formatting).
+# The parallel transform splits the input file into ~HASH_TOKEN_CHUNK_SIZE_TARGET
+# byte chunks and runs the Datavant CLI on each chunk concurrently. The chunk
+# count is ceil(file_size / target), clamped to [1, HASH_TOKEN_MAX_CHUNKS].
+#
+# HASH_TOKEN_MAX_CHUNKS caps per-partner concurrency. Worst case across the
+# scheduler is SCHEDULER_PARALLEL_SLOTS * HASH_TOKEN_MAX_CHUNKS concurrent
+# Datavant subprocesses, leaving headroom
 # for the per-slot Spark clusters and disk I/O.
 HASH_TOKEN_CHUNK_SIZE_TARGET = 50 * 1024 * 1024  # 50 MB target per Datavant chunk
 HASH_TOKEN_MAX_CHUNKS        = 16
@@ -112,9 +159,12 @@ MGMT_FIELDS_VALUE       = '01'
 
 harmonized_filed_sizes_dict = {
 
-                            "PATID"               :"64",
-                            "PATID_1"             :"64",
-                            "PATID_2"             :"64",
+                            # PATID family uses a 128 floor: encrypted PATIDs are
+                            # 92 chars, and a floor above that keeps the column
+                            # width identical across populated and empty tables (DC 1.15).
+                            "PATID"               :"128",
+                            "PATID_1"             :"128",
+                            "PATID_2"             :"128",
                             "PERSON_ID"           :"64",
                             "ENCOUNTERID"         :"128",
                             "PROVIDERID"          :"64",
@@ -410,3 +460,7 @@ PCORNET_PRIMARY_KEYS = {
 
 
 }
+# patterns_remover_fix 1.0 has never removed anything: its regex was built from
+# Column objects instead of the pattern strings. Keep that (no-op) behavior
+# until the data team approves applying common/lists/patterns_list.csv for real.
+PATTERNS_REMOVER_APPLY_PATTERNS = False

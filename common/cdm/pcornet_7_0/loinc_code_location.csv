@@ -86070,7 +86070,7 @@ loinc_num	long_common_name	classtype	found_in_lab	found_in_obs_clin	found_in_obs
 11523-8	EEG study report	2		1	1
 11524-6	EKG study	2		1	1
 11525-3	US for pregnancy	2		1	1
-11526-1	Pathology study	2		1	1
+11526-1	Pathology study	1	1	0	0
 11527-9	Psychiatry study	2		1	1
 1152-8	Deprecated Lu NOS Ag [Presenc	1	1		
 11528-7	Deprecated Radiology Unspecif	3			1

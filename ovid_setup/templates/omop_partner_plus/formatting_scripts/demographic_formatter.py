@@ -84,6 +84,16 @@ try:
                                                     joined_person['sex'].alias("GENDER_IDENTITY"),
                                                     joined_person['ethnicity_concept_code'].alias("HISPANIC"),
                                                     joined_person['race_concept_code'].alias("RACE"),
+                                                    # PCORnet v7.0 RACE_ETH_* fields: emitted empty here, populated by
+                                                    # common race_eth_fix (see fixer_scripts/demographic_fixer.py).
+                                                    lit('').alias("RACE_ETH_MISSING"),
+                                                    lit('').alias("RACE_ETH_AI_AN"),
+                                                    lit('').alias("RACE_ETH_ASIAN"),
+                                                    lit('').alias("RACE_ETH_BLACK"),
+                                                    lit('').alias("RACE_ETH_HISPANIC"),
+                                                    lit('').alias("RACE_ETH_ME_NA"),
+                                                    lit('').alias("RACE_ETH_NH_PI"),
+                                                    lit('').alias("RACE_ETH_WHITE"),
                                                     lit('N').alias("BIOBANK_FLAG"),
                                                     joined_person['spoken_language'].alias("PAT_PREF_LANGUAGE_SPOKEN"),
                                                     joined_person['sex_source_value'].alias("RAW_SEX"),

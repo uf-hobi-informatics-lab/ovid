@@ -1,14 +1,27 @@
 """Panel LOINC remover fix (DC_1_20).
 
 Removes rows from a CDM table where the LOINC code is classified as a panel-type
-LOINC in the EDC reference table (CHARACTERIZATION.EDC_REF.LOINC_REF_RAW).
+LOINC. Panel-order LOINC codes represent orders for groups of tests (e.g., "CBC
+panel") rather than individual results. The PCORnet EDC DC_1_20 check flags tables
+where panel LOINCs exceed 5% of all LOINC-coded records.
 
-Panel-order LOINC codes represent orders for groups of tests (e.g., "CBC panel")
-rather than individual results. The PCORnet EDC DC_1_20 check flags tables where
-panel LOINCs exceed a threshold percentage of all LOINC-coded records.
+Panel source — PINNED SNAPSHOT
+---------------------------------------------------
+This fix reads the panel-LOINC set from a **pinned snapshot CSV** in
+``common/lists/<src1>.csv`` (header-less, one LOINC per line) rather than from the
+live Snowflake reference ``CHARACTERIZATION.EDC_REF.LOINC_REF_RAW``.
+
+Rationale: a live LOINC reference can be re-classified between refresh cycles --
+individual-result LOINCs (e.g. 3137-7 respiratory rate, 9279-1, 39156-5 BMI,
+8479-8, ...) may become flagged ``PANEL_TYPE='Panel'``. Driving the fix from a live
+reference then deletes legitimate individual-result rows and produces DC 4.01 /
+DC 4.03 persistence exceptions. Pinning the panel set (only 85354-9 "Blood
+pressure panel") keeps the behavior stable: panel rows are removed (DC 1.20) while
+no individual-result codes are dropped.
 
 Parameters via argparse:
-    -sr1 (src1): Snowflake DB server (e.g., "your-account.region")
+    -sr1 (src1): Pinned panel-LOINC list name (without ``.csv``), resolved against
+                 ``common/lists/<src1>.csv`` (e.g. "panel_loinc_snapshot").
     -sr2 (src2): Comma-separated pair "CODE_COLUMN,TYPE_COLUMN" identifying the
                  LOINC code column and the type column used to filter for LOINC-coded
                  rows (e.g., "OBSCLIN_CODE,OBSCLIN_TYPE" for OBS_CLIN,
@@ -16,14 +29,13 @@ Parameters via argparse:
                  Only rows where TYPE_COLUMN == 'LC' are evaluated for panel removal.
 """
 
-import pyspark
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, upper, broadcast
 from commonFunctions import CommonFuncitons
 import argparse
 
 
-cf = CommonFuncitons('NotUsed')
+cf: CommonFuncitons = CommonFuncitons('NotUsed')
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--data_folder")
@@ -36,29 +48,24 @@ parser.add_argument("-sr1", "--src1")
 parser.add_argument("-sr2", "--src2")
 
 args = parser.parse_args()
-input_data_folder       = args.data_folder
-examined_table_name     = args.table
-input_partner_name      = args.partner
-db_server               = args.src1
-src2_parts              = args.src2.split(",")
-code_column             = src2_parts[0].strip()
-type_column             = src2_parts[1].strip()
-input_data_folder_path  = args.input_path
-output_data_folder_path = args.output_path
-fixed_table_name        = args.fixed_table_name
+input_data_folder: str = args.data_folder
+examined_table_name: str = args.table
+input_partner_name: str = args.partner
+panel_list_name: str = args.src1
+src2_parts: list = args.src2.split(",")
+code_column: str = src2_parts[0].strip()
+type_column: str = src2_parts[1].strip()
+input_data_folder_path: str = args.input_path
+output_data_folder_path: str = args.output_path
+fixed_table_name: str = args.fixed_table_name
 
-spark = cf.get_spark_session("panel_loinc_remover_fix")
+spark: SparkSession = cf.get_spark_session("panel_loinc_remover_fix")
 
-this_fix_name = 'common_panel_loinc_remover_fix_1.0'
-examined_table_name_parsed = examined_table_name.replace('mapped_', '').replace('.csv', '')
-
-# Snowflake coordinates for the EDC LOINC reference table
-SF_DB_NAME     = 'CHARACTERIZATION'
-SF_SCHEMA_NAME = 'EDC_REF'
-SF_TABLE_NAME  = 'LOINC_REF_RAW'
+this_fix_name: str = 'common_panel_loinc_remover_fix_1.0'
+examined_table_name_parsed: str = examined_table_name.replace('mapped_', '').replace('.csv', '')
 
 # The type value that indicates LOINC-coded rows in PCORnet CDM
-LOINC_TYPE_VALUE = 'LC'
+LOINC_TYPE_VALUE: str = 'LC'
 
 
 try:
@@ -76,24 +83,14 @@ try:
         format="csv", sep="\t", inferSchema="false", header="true", quote='"'
     )
 
-    # Query the EDC LOINC reference table from Snowflake
-    loinc_ref = cf.read_from_snowflake(
-        db_server=db_server,
-        db_name=SF_DB_NAME,
-        schema_name=SF_SCHEMA_NAME,
-        table_name=SF_TABLE_NAME
+    # Read the PINNED panel-LOINC snapshot from common/lists/<src1>.csv
+    # (header-less, one LOINC per line). Mirrors the loading idiom used by
+    # list_remover_fix, replacing the previous live Snowflake reference query.
+    panel_list_path: str = f'common/lists/{panel_list_name}.csv'
+    panel_list_df = spark.read.load(
+        panel_list_path, format="csv", inferSchema="false", header="false", quote='"'
     )
-
-    # Extract panel-type LOINC codes from the reference
-    panel_loincs = (
-        loinc_ref
-        .filter(upper(col("PANEL_TYPE")) == "PANEL")
-        .select(col("LOINC_NUM").alias("PANEL_LOINC_NUM"))
-        .distinct()
-    )
-
-    # Broadcast the panel LOINC list since it is much smaller than the main table
-    panel_loincs_bc = broadcast(panel_loincs)
+    panel_loinc_codes: list = [row['_c0'] for row in panel_list_df.collect()]
 
     # Split: only evaluate LOINC-coded rows (TYPE_COLUMN == 'LC') for panel removal.
     # Non-LOINC rows pass through unconditionally.
@@ -102,17 +99,10 @@ try:
         (col(type_column).isNull()) | (upper(col(type_column)) != LOINC_TYPE_VALUE)
     )
 
-    # Among LOINC rows, separate panel rows from non-panel rows
-    panel_rows = loinc_rows.join(
-        panel_loincs_bc,
-        loinc_rows[code_column] == panel_loincs_bc["PANEL_LOINC_NUM"],
-        how="inner"
-    ).drop("PANEL_LOINC_NUM")
-
-    non_panel_loinc_rows = loinc_rows.join(
-        panel_loincs_bc,
-        loinc_rows[code_column] == panel_loincs_bc["PANEL_LOINC_NUM"],
-        how="left_anti"
+    # Among LOINC rows, separate panel rows (in the pinned list) from non-panel rows.
+    panel_rows = loinc_rows.filter(col(code_column).isin(panel_loinc_codes))
+    non_panel_loinc_rows = loinc_rows.filter(
+        (col(code_column).isNull()) | (~col(code_column).isin(panel_loinc_codes))
     )
 
     # Combine non-LOINC rows + non-panel LOINC rows = the kept rows

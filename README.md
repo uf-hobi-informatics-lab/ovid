@@ -5,7 +5,7 @@ Developed and maintained by **OneFlorida+**
 - Abdelali Nouina - abdelali@ufl.edu
 - Alexander T. Loiacono - atloiaco@ufl.edu
 
-Last Updated: 9/15/2026
+Last Updated: 10/28/2026
 
 # Ovid
 
@@ -69,6 +69,47 @@ The installer will:
 4. Copy OMOP vocabulary tables
 
 You can also use the installer to create new partners from predefined templates (OMOP 5.3, OneFL OMOP-Like, or PCORnet CDM).
+
+## Target CDM version
+
+The `pcornet_mappers` target **PCORnet CDM v7.0** (`CDM_VERSION = '070'`). The schema and valuesets
+are read from `common/lists/2025_01_23_PCORnet_Common_Data_Model_v7dot0_parseable.xlsx` and
+`common/cdm/pcornet_7_0/`.
+
+## Partner templates
+
+`ovid_setup/templates/` contains the starting point for a new partner:
+
+| Template | Source data |
+|----------|-------------|
+| `omop_partner_plus` | OMOP CDM 5.x ("OMOP Plus": OMOP tables plus `*_sup` supplemental tables, `address.csv`, `hash_token*.csv`, ...) |
+| `omop_partner_1`    | OneFL OMOP-like extract |
+| `pcornet_partner_1` | Native PCORnet CDM files |
+
+Each template ships the formatters, fixers and `dictionaries.py` required by every mapper in
+`mapping_scripts/pcornet_mappers/`. All three parts belong to the same release, so update the
+dictionaries, formatters and fixers together with `common/` and `mapping_scripts/`. To check a
+template or your own partner folder against the mappers, run:
+
+        python3 ovid_setup/validate_templates.py                       # all templates
+        python3 ovid_setup/validate_templates.py partners/my_partner   # your partner folder
+
+This reports any dictionary a mapper references that `dictionaries.py` does not define, and any
+column a mapper reads that the formatter does not produce. The generated template dictionaries
+hold generic PCORnet v7.0 valueset mappings. Extend them with your site's raw source values.
+
+Notes for PCORnet v7.0 fields:
+- `DEMOGRAPHIC.RACE_ETH_*`: the formatters emit the eight `RACE_ETH_*` columns empty, and the
+  common `race_eth_fix` (enabled in `fixer_scripts/demographic_fixer.py`) derives them from `RACE` / `HISPANIC`.
+- `LDS_ADDRESS_HISTORY.STATE_FIPS / COUNTY_FIPS / RUCA_ZIP`: derived by the mapper from
+  `ADDRESS_ZIP9` / `ADDRESS_ZIP5` using the geocoding reference below.
+
+## Geocoding reference file
+
+`common/lists/FULL_GEOCODING_202603_16.csv.gz` (ZIP9 to Census state/county/tract/block-group and
+RUCA-2020) is included in the repository, gzip-compressed because the uncompressed file is
+about 430 MB. No extra step is needed: Ovid reads the `.csv.gz` directly, or a decompressed
+`FULL_GEOCODING_202603_16.csv` if one is present. See `common/lists/README.md`.
 
 # Running Ovid
 

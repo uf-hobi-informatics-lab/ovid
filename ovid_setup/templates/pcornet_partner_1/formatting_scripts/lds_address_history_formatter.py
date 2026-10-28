@@ -148,7 +148,8 @@ try:
             validate_zip5_udf(lds_address_history_in['address_zip5']).alias('ADDRESS_ZIP5'),
             validate_zip9_udf(lds_address_history_in['address_zip9']).alias('ADDRESS_ZIP9'),
             cf.format_date_udf(lds_address_history_in['address_period_start']).alias('ADDRESS_PERIOD_START'),
-            cf.format_date_udf(lds_address_history_in['address_period_end']).alias('ADDRESS_PERIOD_END')
+            cf.format_date_udf(lds_address_history_in['address_period_end']).alias('ADDRESS_PERIOD_END'),
+            (lds_address_history_in['current_address_flag'] if 'current_address_flag' in lds_address_history_in.columns else lit('')).alias('CURRENT_ADDRESS_FLAG')
         )
     except:
         lds_address_history_in = spark.read.load(input_data_folder_path+lds_address_history_table_name,format="csv", sep=",", inferSchema="false", header="true", quote= '"')
@@ -164,7 +165,8 @@ try:
             validate_zip5_udf(lds_address_history_in['ADDRESS_ZIP5']).alias('ADDRESS_ZIP5'),
             validate_zip9_udf(lds_address_history_in['ADDRESS_ZIP9']).alias('ADDRESS_ZIP9'),
             cf.format_date_udf(lds_address_history_in['ADDRESS_PERIOD_START']).alias('ADDRESS_PERIOD_START'),
-            cf.format_date_udf(lds_address_history_in['ADDRESS_PERIOD_END']).alias('ADDRESS_PERIOD_END')
+            cf.format_date_udf(lds_address_history_in['ADDRESS_PERIOD_END']).alias('ADDRESS_PERIOD_END'),
+            (lds_address_history_in['CURRENT_ADDRESS_FLAG'] if 'CURRENT_ADDRESS_FLAG' in lds_address_history_in.columns else lit('')).alias('CURRENT_ADDRESS_FLAG')
         )
 
 

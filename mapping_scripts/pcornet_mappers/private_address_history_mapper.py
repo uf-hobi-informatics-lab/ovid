@@ -83,7 +83,7 @@ try:
         # deduplicated_data_folder_path = '/app/partners/'+input_partner.lower()+'/data/deduplicator_output/'+ input_data_folder+'/'
         deduplicated_data_folder_path = '/app/partners/' + input_partner.lower() + '/data/' + input_data_folder + '/deduplicator_output/' 
         mapped_data_folder_path    = '/app/partners/'+input_partner.lower()+'/data/' + input_data_folder + '/mapper_output/'
-        geocoding_table_path                   = f'/app/common/lists/FULL_GEOCODING_202603_16.csv'
+        geocoding_table_path                   = cf.get_geocoding_path()  # FULL_GEOCODING_*.csv or .csv.gz
 
     ###################################################################################################################################
     # Loading the unmapped enctounter table

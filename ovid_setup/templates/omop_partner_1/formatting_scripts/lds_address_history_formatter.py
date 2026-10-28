@@ -86,7 +86,8 @@ try:
                                                     joined_lds_address_history['zip_9'].alias("ADDRESS_ZIP9"), 
                                                     lit('').alias("ADDRESS_COUNTY"),
                                                     joined_lds_address_history['address_period_start'].alias("ADDRESS_PERIOD_START"),
-                                                    joined_lds_address_history['address_period_end'].alias("ADDRESS_PERIOD_END"),                                          
+                                                    joined_lds_address_history['address_period_end'].alias("ADDRESS_PERIOD_END"),
+                                                    (joined_lds_address_history['current_address_flag'] if 'current_address_flag' in joined_lds_address_history.columns else lit('')).alias("CURRENT_ADDRESS_FLAG"),                                          
                                                     
                                                         )
 
@@ -140,7 +141,8 @@ except Exception as e:
                                                     joined_lds_address_history['zip_9'].alias("ADDRESS_ZIP9"), 
                                                     lit('').alias("ADDRESS_COUNTY"),
                                                     joined_lds_address_history['address_period_start'].alias("ADDRESS_PERIOD_START"),
-                                                    joined_lds_address_history['address_period_end'].alias("ADDRESS_PERIOD_END"),                                          
+                                                    joined_lds_address_history['address_period_end'].alias("ADDRESS_PERIOD_END"),
+                                                    (joined_lds_address_history['current_address_flag'] if 'current_address_flag' in joined_lds_address_history.columns else lit('')).alias("CURRENT_ADDRESS_FLAG"),                                          
                                                     
                                                         )
 

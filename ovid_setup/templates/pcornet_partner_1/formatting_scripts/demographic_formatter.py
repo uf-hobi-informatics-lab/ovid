@@ -61,6 +61,16 @@ try:
                             demographic_IN['gender_identity'].alias('GENDER_IDENTITY'),
                             demographic_IN['hispanic'].alias('HISPANIC'),
                             demographic_IN['race'].alias('RACE'),
+                            # PCORnet v7.0 RACE_ETH_* fields: emitted empty here, populated by
+                            # common race_eth_fix (see fixer_scripts/demographic_fixer.py).
+                            lit('').alias('RACE_ETH_MISSING'),
+                            lit('').alias('RACE_ETH_AI_AN'),
+                            lit('').alias('RACE_ETH_ASIAN'),
+                            lit('').alias('RACE_ETH_BLACK'),
+                            lit('').alias('RACE_ETH_HISPANIC'),
+                            lit('').alias('RACE_ETH_ME_NA'),
+                            lit('').alias('RACE_ETH_NH_PI'),
+                            lit('').alias('RACE_ETH_WHITE'),
                             lit('N').alias('BIOBANK_FLAG'),
                             demographic_IN['pat_pref_language_spoken'].alias('PAT_PREF_LANGUAGE_SPOKEN'),
                             demographic_IN['raw_sex'].alias('RAW_SEX'),
@@ -85,6 +95,16 @@ try:
                         demographic_IN['GENDER_IDENTITY'].alias('GENDER_IDENTITY'),
                         demographic_IN['HISPANIC'].alias('HISPANIC'),
                         demographic_IN['RACE'].alias('RACE'),
+                        # PCORnet v7.0 RACE_ETH_* fields: emitted empty here, populated by
+                        # common race_eth_fix (see fixer_scripts/demographic_fixer.py).
+                        lit('').alias('RACE_ETH_MISSING'),
+                        lit('').alias('RACE_ETH_AI_AN'),
+                        lit('').alias('RACE_ETH_ASIAN'),
+                        lit('').alias('RACE_ETH_BLACK'),
+                        lit('').alias('RACE_ETH_HISPANIC'),
+                        lit('').alias('RACE_ETH_ME_NA'),
+                        lit('').alias('RACE_ETH_NH_PI'),
+                        lit('').alias('RACE_ETH_WHITE'),
                         lit('N').alias('BIOBANK_FLAG'),
                         demographic_IN['PAT_PREF_LANGUAGE_SPOKEN'].alias('PAT_PREF_LANGUAGE_SPOKEN'),
                         demographic_IN['RAW_SEX'].alias('RAW_SEX'),

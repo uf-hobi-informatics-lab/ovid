@@ -50,8 +50,14 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.hyperlink import Hyperlink
 import fnmatch
 import csv
+import errno
+import tempfile
 from typing import Optional, Tuple
 from ovid_logging import get_logger as _get_ovid_logger
+
+# Environment variable through which apply_fix() passes each fix subprocess the
+# path of its private failure-marker file (see _record_fix_failure).
+FIX_FAILURE_MARKER_ENV_VAR: str = 'OVID_FIX_FAILURE_MARKER'
 
 
 ###################################################################################################################################
@@ -220,6 +226,7 @@ class CommonFuncitons:
         'UCI': 'UCI',
         'UMN': 'UMN',
         "VRT": "VRT",
+        "BAY": "BAY",
         'omop_partner_1': 'omop_partner_1',
         'omop_partner_plus': 'omop_partner_plus',
         'pcornert_partner_1': 'pcornert_partner_1',
@@ -397,31 +404,187 @@ class CommonFuncitons:
 
    
     @classmethod
-    def write_pyspark_output_file(cls,payspark_df, output_file_name, output_data_folder_path ):
+    def write_pyspark_output_file(cls, payspark_df, output_file_name: str, output_data_folder_path: str) -> None:
+        """Write a DataFrame as one tab-delimited CSV file (header + rows).
 
-        work_directory = output_data_folder_path+"tmp_"+output_file_name
+        Spark writes header-less part files to ``tmp_<output_file_name>``.
+        The parts are then concatenated in parallel (kernel-side
+        ``copy_file_range``) into ``<output_file_name>.partial``, which is
+        atomically renamed onto the final path. Each part is deleted as soon
+        as it has been copied, so peak disk use stays near 1x the table size.
 
-        payspark_df = payspark_df.select([
-            F.lit(None).cast('string').alias(i.name)
-            if isinstance(i.dataType, NullType)
-            else i.name
-            for i in payspark_df.schema
+        Before 2026-10-13 the parts were merged by one single-threaded
+        ``awk ... > output`` redirect. That truncated the target before reading
+        (the same file the fix had just read), needed ~2x the table size of
+        free disk, and left ``tmp_`` directories behind when it failed ("No space left on device"
+        on very large tables).
+
+        Args:
+            payspark_df: DataFrame to write. The name is kept for the
+                ~700 existing keyword callers (it should be ``pyspark_df``).
+            output_file_name: Output file name, e.g. ``fixed_obs_clin.csv``.
+            output_data_folder_path: Output folder (with trailing slash).
+
+        Raises:
+            Exception: Any Spark write or file-merge error. The final file is
+                left untouched, and the temporary directory and partial file
+                are removed.
+        """
+        pyspark_df = payspark_df
+        work_directory: str = output_data_folder_path + "tmp_" + output_file_name
+        output_file_path: str = os.path.join(output_data_folder_path, output_file_name).replace('tmp_', '')
+        partial_file_path: str = output_file_path + PARTIAL_OUTPUT_SUFFIX
+
+        pyspark_df = pyspark_df.select([
+            F.lit(None).cast('string').alias(field.name)
+            if isinstance(field.dataType, NullType)
+            else field.name
+            for field in pyspark_df.schema
             ])
+        header_line: str = "\t".join(pyspark_df.columns) + "\n"
 
+        try:
+            pyspark_df.write.format("csv").option("header", False).option("nullValue", None) \
+                .option("delimiter", "\t").option("quote", "").mode("overwrite").save(work_directory)
 
-        payspark_df.write.format("csv").option("header", True).option("nullValue",None).option("delimiter", "\t").option("quote", "").mode("overwrite").save(work_directory)
+            part_file_paths: list[str] = sorted(glob.glob(os.path.join(work_directory, "part-*.csv")))
+            cls._concatenate_part_files(part_file_paths, partial_file_path, header_line)
+            os.replace(partial_file_path, output_file_path)
+        finally:
+            cls._remove_path_quietly(work_directory)
+            cls._remove_path_quietly(partial_file_path)
 
+    @classmethod
+    def append_pyspark_output_file(cls, pyspark_df, output_file_name: str, output_data_folder_path: str) -> None:
+        """Append a DataFrame's rows to a tab-delimited CSV, creating it if needed.
 
+        Used by the fix chain for the snomed pass-2 diagnostics. These used to
+        be ``collect()``-ed to the driver; now they are written by Spark and
+        then appended.
 
-        output_file_path = os.path.join(output_data_folder_path, output_file_name).replace('tmp_','')
-        
-        # Update the awk command to use the correct Python variable for the output path
-        command = f"awk 'FNR==1 && NR!=1{{next}} 1' {work_directory}/part-*.csv > {output_file_path}"
-        subprocess.run(command, shell=True, check=True)
+        Args:
+            pyspark_df: DataFrame to append (same columns as the existing file).
+            output_file_name: Target file name.
+            output_data_folder_path: Target folder (with trailing slash).
 
-        command = ["rm","-r", work_directory]
-        # Execute the command
-        subprocess.run(" ".join(command), shell=True)
+        Raises:
+            Exception: Any Spark write or file I/O error.
+        """
+        target_path: str = os.path.join(output_data_folder_path, output_file_name)
+        if not os.path.exists(target_path):
+            cls.write_pyspark_output_file(payspark_df=pyspark_df, output_file_name=output_file_name,
+                                          output_data_folder_path=output_data_folder_path)
+            return
+        rows_file_name: str = f"append_{os.getpid()}_{output_file_name}"
+        rows_path: str = os.path.join(output_data_folder_path, rows_file_name)
+        try:
+            cls.write_pyspark_output_file(payspark_df=pyspark_df, output_file_name=rows_file_name,
+                                          output_data_folder_path=output_data_folder_path)
+            with open(rows_path, 'rb') as rows_file, open(target_path, 'ab') as target_file:
+                rows_file.readline()  # skip the header
+                shutil.copyfileobj(rows_file, target_file, 64 * 1024 * 1024)
+        finally:
+            cls._remove_path_quietly(rows_path)
+
+    @classmethod
+    def _concatenate_part_files(cls, part_file_paths: list[str], output_file_path: str,
+                                header_line: str) -> None:
+        """Concatenate Spark part files behind a header line, in parallel.
+
+        Every part is copied straight to its final byte offset with
+        ``os.copy_file_range`` (falling back to ``pread``/``pwrite``), using
+        ``FIXED_FILE_MERGE_MAX_WORKERS`` threads. Each part is deleted once it
+        has been copied.
+
+        Args:
+            part_file_paths: Part files, in output order.
+            output_file_path: File to create (truncated if it exists).
+            header_line: Header text, including the trailing newline.
+
+        Raises:
+            OSError: If a read, write, or copy fails (e.g. disk full).
+        """
+        header_bytes: bytes = header_line.encode('utf-8')
+        part_sizes: list[int] = [os.path.getsize(path) for path in part_file_paths]
+        part_offsets: list[int] = []
+        next_offset: int = len(header_bytes)
+        for part_size in part_sizes:
+            part_offsets.append(next_offset)
+            next_offset += part_size
+
+        output_fd: int = os.open(output_file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            written: int = 0
+            while written < len(header_bytes):
+                written += os.write(output_fd, header_bytes[written:])
+            os.ftruncate(output_fd, next_offset)
+
+            def copy_part(part_index: int) -> None:
+                cls._copy_file_to_offset(part_file_paths[part_index], output_fd,
+                                         part_sizes[part_index], part_offsets[part_index])
+                os.remove(part_file_paths[part_index])
+
+            if part_file_paths:
+                worker_count: int = builtins.min(FIXED_FILE_MERGE_MAX_WORKERS, len(part_file_paths))
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    for future in as_completed([executor.submit(copy_part, index)
+                                                for index in range(len(part_file_paths))]):
+                        future.result()
+        finally:
+            os.close(output_fd)
+
+    @classmethod
+    def _copy_file_to_offset(cls, source_path: str, output_fd: int, size: int, output_offset: int) -> None:
+        """Copy a whole file into an open file descriptor at a given offset.
+
+        Args:
+            source_path: File to copy.
+            output_fd: Destination file descriptor, opened for writing.
+            size: Number of bytes to copy (the size of ``source_path``).
+            output_offset: Byte offset in the destination to write at.
+
+        Raises:
+            OSError: On read/write failure or if the source is shorter than ``size``.
+        """
+        chunk_size: int = 64 * 1024 * 1024
+        source_fd: int = os.open(source_path, os.O_RDONLY)
+        try:
+            copied: int = 0
+            use_copy_file_range: bool = hasattr(os, 'copy_file_range')
+            while copied < size:
+                chunk_bytes: int = builtins.min(chunk_size, size - copied)
+                if use_copy_file_range:
+                    try:
+                        transferred: int = os.copy_file_range(source_fd, output_fd, chunk_bytes,
+                                                              copied, output_offset + copied)
+                    except OSError as copy_error:
+                        if copy_error.errno not in (errno.EXDEV, errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+                            raise
+                        use_copy_file_range = False
+                        continue
+                else:
+                    data: bytes = os.pread(source_fd, chunk_bytes, copied)
+                    transferred = os.pwrite(output_fd, data, output_offset + copied) if data else 0
+                if transferred <= 0:
+                    raise OSError(f"Short copy from {source_path}: copied {copied} of {size} bytes")
+                copied += transferred
+        finally:
+            os.close(source_fd)
+
+    @classmethod
+    def _remove_path_quietly(cls, path: str) -> None:
+        """Remove a file or directory tree if it exists, logging failures.
+
+        Args:
+            path: File or directory to remove.
+        """
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            elif os.path.lexists(path):
+                os.remove(path)
+        except OSError:
+            _get_ovid_logger().error(f"Failed to remove temporary path {path}", exc_info=True)
 
 
 ###################################################################################################################################
@@ -438,6 +601,36 @@ class CommonFuncitons:
                 # Execute the command
         subprocess.run(" ".join(command), shell=True)
 
+
+
+###################################################################################################################################
+# Geocoding reference (ZIP9 -> Census state/county/tract/block, RUCA).
+# Ships in the repo gzip-compressed as common/lists/FULL_GEOCODING_<version>.csv.gz (the
+# uncompressed CSV is ~430 MB, over GitHub's per-file limit). Spark reads .gz transparently
+# and open_geocoding_file() handles it for the pure-Python readers, so decompressing is
+# optional: an uncompressed .csv next to it is preferred when present.
+###################################################################################################################################
+
+    GEOCODING_FILE_BASENAME = 'FULL_GEOCODING_202603_16'
+
+    @classmethod
+    def get_geocoding_path(cls, lists_dir='/app/common/lists'):
+        base = os.path.join(lists_dir, cls.GEOCODING_FILE_BASENAME)
+        for candidate in (base + '.csv', base + '.csv.gz'):
+            if os.path.exists(candidate):
+                return candidate
+        raise FileNotFoundError(
+            f"Geocoding reference not found: expected {base}.csv or {base}.csv.gz "
+            "(see common/lists/README.md)."
+        )
+
+    @classmethod
+    def open_geocoding_file(cls):
+        import gzip
+        path = cls.get_geocoding_path()
+        if path.endswith('.gz'):
+            return gzip.open(path, 'rt', newline='')
+        return open(path, 'r', newline='')
 
 
 ###################################################################################################################################
@@ -595,11 +788,11 @@ class CommonFuncitons:
         import csv
         from collections import Counter
 
-        geocoding_path = '/app/common/lists/FULL_GEOCODING_202603_16.csv'
+        # .csv or .csv.gz -- see get_geocoding_path()
 
         zip5_county_counts = {}  # {zip5: Counter({county_fips_5digit: count})}
 
-        with open(geocoding_path, 'r') as f:
+        with cls.open_geocoding_file() as f:
             reader = csv.DictReader(f)
             for row in reader:
                 zip9 = (row.get('ZIP9') or '').strip()
@@ -687,11 +880,11 @@ class CommonFuncitons:
         import csv
         from collections import Counter
 
-        geocoding_path = '/app/common/lists/FULL_GEOCODING_202603_16.csv'
+        # .csv or .csv.gz -- see get_geocoding_path()
 
         zip5_zcta_counts = {}  # {zip5: Counter({zcta: count})}
 
-        with open(geocoding_path, 'r') as f:
+        with cls.open_geocoding_file() as f:
             reader = csv.DictReader(f)
             for row in reader:
                 zip9 = (row.get('ZIP9') or '').strip()
@@ -892,14 +1085,31 @@ class CommonFuncitons:
                                 
                     columns_to_consider = [df.columns[0], df.columns[1],df.columns[2],df.columns[3], df.columns[4]]
 
+                elif file_name == 'GOAL':
+                                
+                    columns_to_consider = [df.columns[0], df.columns[1],df.columns[2],df.columns[3], df.columns[4], df.columns[5]]
+
+                elif file_name == 'TREATMENTTEAM_NURSE':
+                                
+                    columns_to_consider = [df.columns[0], df.columns[1],df.columns[2],df.columns[3], df.columns[4], df.columns[5]]
+
                 elif file_name == 'PROBLEM_CONTACT':
                                 
                     columns_to_consider = [df.columns[0], df.columns[1],df.columns[2],df.columns[3], df.columns[4], df.columns[5]]
-      
+
                 elif file_name == 'INTERVENTION_CONTACT' :
                                 
                     columns_to_consider = [df.columns[0], df.columns[1],df.columns[2],df.columns[3], df.columns[4], df.columns[5], df.columns[6]]
-   
+
+
+                elif file_name == 'GOAL_CONTACT' :
+                                
+                    columns_to_consider = [df.columns[0], df.columns[1],df.columns[2],df.columns[3], df.columns[4], df.columns[5], df.columns[6]]
+
+
+                elif file_name == 'UNIT' :
+                                
+                    columns_to_consider = [df.columns[0], df.columns[1],df.columns[2],df.columns[3], df.columns[4], df.columns[5], df.columns[6]]  
                 elif file_name in ('HASH_TOKEN', 'DEATH', 'VERITAS_EXPANDED') and partner.lower() == 'vrt':
 
                     columns_to_consider = df.columns  # deduplicate by entire row
@@ -970,6 +1180,21 @@ class CommonFuncitons:
                 seen[$1, $2, $3] > 1 {{ print > "{duplicates_output_file}" }}
                 '''
 
+            elif file_name == 'GOAL':
+                gawk_script = f'''
+                BEGIN {{ FS = OFS = "\t" }}
+                NR == 1 {{ header = $0; print header > "{deduplicated_output_file}"; print header > "{duplicates_output_file}"; next }}
+                !seen[$1, $2, $3, $4, $5]++ {{ print > "{deduplicated_output_file}" }}
+                seen[$1, $2, $3, $4, $5] > 1 {{ print > "{duplicates_output_file}" }}
+                '''
+
+            elif file_name == 'TREATMENTTEAM_NURSE':
+                gawk_script = f'''
+                BEGIN {{ FS = OFS = "\t" }}
+                NR == 1 {{ header = $0; print header > "{deduplicated_output_file}"; print header > "{duplicates_output_file}"; next }}
+                !seen[$1, $2, $3, $4, $5]++ {{ print > "{deduplicated_output_file}" }}
+                seen[$1, $2, $3, $4, $5] > 1 {{ print > "{duplicates_output_file}" }}
+                '''
 
             elif file_name == 'FACT_RELATIONSHIP':
                 gawk_script = f'''
@@ -986,6 +1211,22 @@ class CommonFuncitons:
                 seen[$1, $2, $3, $4, $5, $6] > 1 {{ print > "{duplicates_output_file}" }}
                 '''
             elif file_name == 'INTERVENTION_CONTACT' :
+                gawk_script = f'''
+                BEGIN {{ FS = OFS = "\t" }}
+                NR == 1 {{ header = $0; print header > "{deduplicated_output_file}"; print header > "{duplicates_output_file}"; next }}
+                !seen[$1, $2, $3, $4, $5, $6, $7]++ {{ print > "{deduplicated_output_file}" }}
+                seen[$1, $2, $3, $4, $5, $6, $7] > 1 {{ print > "{duplicates_output_file}" }}
+                '''
+
+            elif file_name == 'GOAL_CONTACT' :
+                gawk_script = f'''
+                BEGIN {{ FS = OFS = "\t" }}
+                NR == 1 {{ header = $0; print header > "{deduplicated_output_file}"; print header > "{duplicates_output_file}"; next }}
+                !seen[$1, $2, $3, $4, $5, $6, $7]++ {{ print > "{deduplicated_output_file}" }}
+                seen[$1, $2, $3, $4, $5, $6, $7] > 1 {{ print > "{duplicates_output_file}" }}
+                '''
+
+            elif file_name == 'UNIT' :
                 gawk_script = f'''
                 BEGIN {{ FS = OFS = "\t" }}
                 NR == 1 {{ header = $0; print header > "{deduplicated_output_file}"; print header > "{duplicates_output_file}"; next }}
@@ -2077,7 +2318,36 @@ class CommonFuncitons:
 
     @classmethod
 
-    def apply_fix(cls,fix_type, fix_name, version, input_path, output_path,fixed_table_name,mapped_table_name,input_data_folder,partner_name, src1, src2):
+    def apply_fix(cls, fix_type: str, fix_name: str, version: str, input_path: str, output_path: str,
+                  fixed_table_name: str, mapped_table_name: str, input_data_folder: str,
+                  partner_name: str, src1: str, src2: str) -> None:
+        """Run one fix script as a subprocess and fail loudly if it fails.
+
+        Since 2026-10-04 a failed fix (non-zero exit, or a non-warning message
+        reported via ``print_failure_message``, which the fix records in a
+        private marker file named by ``FIX_FAILURE_MARKER_ENV_VAR``) quarantines
+        the partially fixed table as ``FAILED_<fixed_table_name>`` and raises,
+        so the partner fixer's ``except`` block reports it and the remaining
+        fixes for that table are skipped. Previously the chain kept running on
+        a partially fixed file and the upload stage shipped it (DC 1.08 orphan
+        PATIDs).
+
+        Args:
+            fix_type: ``common`` or ``custom``.
+            fix_name: Fix directory name.
+            version: Fix version (script file name without ``.py``).
+            input_path: Mapper output folder (or fixer output for multi-table fixes).
+            output_path: Fixer output folder.
+            fixed_table_name: Fixed table file name, e.g. ``fixed_diagnosis.csv``.
+            mapped_table_name: Mapped table file name, e.g. ``mapped_diagnosis.csv``.
+            input_data_folder: Batch folder, e.g. ``PARTNER/20260915``.
+            partner_name: Partner name.
+            src1: First fix parameter.
+            src2: Second fix parameter.
+
+        Raises:
+            RuntimeError: If the fix subprocess fails.
+        """
 
         if fix_type == 'custom':
 
@@ -2124,13 +2394,159 @@ class CommonFuncitons:
         # already expected (they communicate fix status and failure
         # messages via file queues, not stdout). shell=False is the
         # correct mode here since `command` is a list.
-        cls.run_subprocess(command, env=env, shell=False)
+        # Failure detection uses a private per-fix marker file rather than the
+        # shared failure queue: the parent ETL's display timer thread drains
+        # and CLEARS that queue within ~100 ms of the failure flag appearing,
+        # so diffing it here raced and lost (a patid_orphans_fix failure
+        # went undetected and the chain continued on the unfixed file).
+        failure_marker_path: str = cls._create_fix_failure_marker()
+        env[FIX_FAILURE_MARKER_ENV_VAR] = failure_marker_path
+        try:
+            result = cls.run_subprocess(command, env=env, shell=False)
+            fatal_failure_count: int = cls._count_fatal_failure_messages(failure_marker_path)
+        finally:
+            cls._remove_fix_failure_marker(failure_marker_path)
+
+        if result.returncode != 0 or fatal_failure_count > 0:
+            cls._quarantine_failed_fixed_table(output_path, fixed_table_name, fix_name, version)
+            raise RuntimeError(
+                f"Fix {fix_type}/{fix_name}/{version} failed on {fixed_table_name} "
+                f"(return code {result.returncode}, failure messages {fatal_failure_count}). "
+                f"Remaining fixes for this table were skipped; re-run the fix stage."
+            )
+
+    @classmethod
+    def _create_fix_failure_marker(cls) -> str:
+        """Create an empty, private failure-marker file for one fix subprocess.
+
+        The path is handed to the fix via ``FIX_FAILURE_MARKER_ENV_VAR``;
+        ``print_failure_message`` appends one record per failure to it. Unlike
+        the shared failure queue, nothing else reads or clears this file.
+
+        Returns:
+            Absolute path of the marker file.
+        """
+        marker_dir: str = os.path.join(cls._get_sync_dir(), 'fix_failure_markers')
+        os.makedirs(marker_dir, exist_ok=True)
+        marker_fd, marker_path = tempfile.mkstemp(prefix='fix_', suffix='.log', dir=marker_dir)
+        os.close(marker_fd)
+        return marker_path
+
+    @classmethod
+    def _remove_fix_failure_marker(cls, marker_path: str) -> None:
+        """Delete a fix failure-marker file, logging (not raising) on error.
+
+        Args:
+            marker_path: Path returned by ``_create_fix_failure_marker``.
+
+        Returns:
+            None.
+        """
+        try:
+            os.remove(marker_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _get_ovid_logger().error(
+                f"Failed to remove fix failure marker {marker_path}", exc_info=True
+            )
+
+    @classmethod
+    def _record_fix_failure(cls, text: str) -> None:
+        """Append a failure record to the fix failure marker, if one is set.
+
+        Called by ``print_failure_message``. No-op outside an ``apply_fix``
+        subprocess (env var unset). Records are separated by a NUL byte so
+        multi-line exception text stays one record.
+
+        Args:
+            text: Failure detail text (exception message).
+
+        Returns:
+            None.
+        """
+        marker_path: Optional[str] = os.environ.get(FIX_FAILURE_MARKER_ENV_VAR)
+        if not marker_path:
+            return
+        try:
+            with open(marker_path, 'a') as marker_file:
+                marker_file.write(text.replace('\0', ' ') + '\0')
+        except OSError:
+            _get_ovid_logger().error(
+                f"Failed to write fix failure marker {marker_path}", exc_info=True
+            )
+
+    @classmethod
+    def _count_fatal_failure_messages(cls, marker_path: str) -> int:
+        """Count failure records in a fix marker that represent a real failure.
+
+        ``print_failure_message`` also reports "Path does not exist" conditions
+        (rendered as orange warnings), e.g. an optional reference table that a
+        partner does not deliver. Those are not treated as fatal so existing
+        fix chains keep their current behavior for missing optional inputs.
+
+        Args:
+            marker_path: Path of the fix's failure-marker file.
+
+        Returns:
+            The number of records that are not missing-path warnings. An
+            unreadable marker counts as one failure (fail closed).
+        """
+        try:
+            with open(marker_path, 'r') as marker_file:
+                content: str = marker_file.read()
+        except OSError:
+            _get_ovid_logger().error(
+                f"Failed to read fix failure marker {marker_path}", exc_info=True
+            )
+            return 1
+        fatal_count: int = 0
+        for record in content.split('\0'):
+            if not record:
+                continue
+            if "Path does not exist" in record or "does not exist in" in record:
+                continue
+            fatal_count += 1
+        return fatal_count
+
+    @classmethod
+    def _quarantine_failed_fixed_table(cls, output_path: str, fixed_table_name: str,
+                                       fix_name: str, version: str) -> None:
+        """Rename a partially fixed table so it cannot be uploaded by mistake.
+
+        Fixes have been observed crashing mid-chain (e.g.
+        ``patid_orphans_fix``) while the remaining fixes kept running and the
+        upload stage shipped the half-fixed file. The fixed file is renamed to
+        ``FAILED_<fixed_table_name>``, which the upload stage's ``fixed_*``
+        file scan ignores.
+
+        Args:
+            output_path: Fixer output folder containing the fixed table.
+            fixed_table_name: File name of the fixed table (e.g. ``fixed_diagnosis.csv``).
+            fix_name: Name of the fix that failed, for logging.
+            version: Version of the fix that failed, for logging.
+
+        Returns:
+            None.
+        """
+        fixed_file_path: str = os.path.join(output_path, fixed_table_name)
+        if not os.path.isfile(fixed_file_path):
+            return
+        quarantined_path: str = os.path.join(output_path, f"FAILED_{fixed_table_name}")
+        try:
+            os.replace(fixed_file_path, quarantined_path)
+            _get_ovid_logger().error(
+                f"Fix {fix_name}/{version} failed; quarantined {fixed_file_path} -> {quarantined_path}"
+            )
+        except OSError:
+            _get_ovid_logger().error(
+                f"Fix {fix_name}/{version} failed and {fixed_file_path} could not be quarantined",
+                exc_info=True,
+            )
 
 ###################################################################################################################################
 # This function will output the mapping gap for the passed formatted file name
 ###################################################################################################################################
-
-   
 
     @classmethod
     def get_mapping_gap(cls,partner,file_name,table_name, file_path,folder_name):
@@ -5174,6 +5590,67 @@ class CommonFuncitons:
 ###################################################################################################################################
 
     @classmethod
+    def _get_harmonized_id_field_widths(cls, spark, db, schema_name, sf_options):
+        """Compute per-schema harmonized widths for shared undefined-length ID fields.
+
+        Queries ``INFORMATION_SCHEMA.COLUMNS`` for the maximum declared character
+        length of each harmonized ID field (the keys of
+        ``harmonized_filed_sizes_dict``) across all tables already present in the
+        target schema. Empty complementary tables are then created with these
+        widths so that every table declares an identical length for PATID and its
+        siblings (PCORnet DC 1.15a field-length harmonization).
+
+        Args:
+            spark: Active SparkSession.
+            db (str): Snowflake database name.
+            schema_name (str): Target schema holding the partner's uploaded tables.
+            sf_options (dict): Base Snowflake connector options (reused; the query
+                is issued against ``INFORMATION_SCHEMA``).
+
+        Returns:
+            dict[str, int]: Map of ID field name to the max declared width found
+            among the existing tables. Empty when the lookup fails or no tables
+            exist yet (callers then fall back to ``harmonized_filed_sizes_dict``).
+        """
+        id_field_names = list(harmonized_filed_sizes_dict.keys())
+        if not id_field_names:
+            return {}
+
+        in_list = ", ".join(f"'{name}'" for name in id_field_names)
+        widths_query = f"""
+        SELECT COLUMN_NAME, MAX(CHARACTER_MAXIMUM_LENGTH) AS MAX_LEN
+        FROM {db}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{schema_name}'
+          AND COLUMN_NAME IN ({in_list})
+          AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL
+        GROUP BY COLUMN_NAME
+        """
+
+        overrides: dict = {}
+        try:
+            options = dict(sf_options)
+            options["sfSchema"] = "INFORMATION_SCHEMA"
+            widths_df = spark.read \
+                .format("net.snowflake.spark.snowflake") \
+                .options(**options) \
+                .option("query", widths_query) \
+                .load()
+            for row in widths_df.collect():
+                max_len = row["MAX_LEN"]
+                if max_len is not None:
+                    overrides[row["COLUMN_NAME"]] = int(max_len)
+        except Exception as e:
+            # Non-fatal: fall back to the global harmonized floor.
+            cls.print_with_style(
+                f"_get_harmonized_id_field_widths: width lookup failed for "
+                f"{db}.{schema_name}; using harmonized defaults ({e})",
+                'warning orange'
+            )
+            return {}
+
+        return overrides
+
+    @classmethod
 
 
     def db_upload_cdm_complementary_tables_snowflake(cls, db, db_server, folder_name, mappers_type, upload_type, merge_db, merge_schema):
@@ -5236,10 +5713,22 @@ class CommonFuncitons:
         # Collect the table names into a Python list
         missing_table_names = [row["TABLE_NAME"] for row in missing_tables_names_df.collect()]
 
+        # DC 1.15a: empty complementary tables must declare the same width for
+        # shared undefined-length ID fields (PATID, PATID_1, PATID_2,
+        # ENCOUNTERID, PROVIDERID, ...) as the partner's already-uploaded
+        # populated tables. Otherwise an empty stub falls back to the global
+        # harmonized floor (e.g. PATID=64) while populated tables carry the
+        # partner's real width (e.g. 128), tripping the field-length
+        # harmonization check. We derive a per-run, per-schema override map from
+        # the max declared column length across the existing tables.
+        field_size_overrides = cls._get_harmonized_id_field_widths(
+            spark, db, schema_name, sf_options
+        )
+
         # Iterate over the names
         for table in missing_table_names:
             
-            schema = cls.get_snowflake_schema(table, spark, mappers_type)
+            schema = cls.get_snowflake_schema(table, spark, mappers_type, field_size_overrides=field_size_overrides)
             empty_df = spark.createDataFrame([], schema)
 
             sf_options = {
@@ -5305,44 +5794,72 @@ class CommonFuncitons:
         cls,
         incoming_df: "pyspark.sql.DataFrame",
         existing_df: "pyspark.sql.DataFrame",
+        enforce_single_current: bool = False,
     ) -> "pyspark.sql.DataFrame":
         """Reconcile an Ovid-built address-history table against its prior state.
 
-        Used at merge-upload time for ``LDS_ADDRESS_HISTORY`` and
-        ``PRIVATE_ADDRESS_HISTORY`` when the partner is flagged
-        ``OVID_BUILDS_LDS_ADDRESS_HISTORY = True`` (Ovid builds the table and the
-        partner submits incrementally). Because Ovid synthesizes the rows for
-        these partners, a plain primary-key anti-join merge (see
-        :meth:`merge_dfs`) cannot express address moves. This helper instead
-        tracks per-patient ZIP changes:
+        Used for ``LDS_ADDRESS_HISTORY`` and ``PRIVATE_ADDRESS_HISTORY`` of
+        partners where Ovid synthesizes the address history (e.g. from the
+        demographic ZIP) rather than receiving it from the partner:
 
-        - For every existing patient whose latest incoming ``ADDRESS_ZIP5``
-          differs from the existing row's ``ADDRESS_ZIP5``, the existing row's
-          ``ADDRESS_PERIOD_END`` is closed with the incoming row's
-          ``ADDRESS_PERIOD_START`` (the "latest start" incoming row wins when a
-          patient has multiple incoming addresses).
-        - The incoming new-ZIP row is kept as a separate row.
-        - Incoming rows whose ``ADDRESSID`` already exists in the DB are dropped
-          (the existing row is authoritative for that primary key); the new row
-          must arrive with a genuinely new ``ADDRESSID``.
-        - Existing patients with no ZIP change, and existing/incoming patients
-          that appear on only one side, are carried through unchanged.
+        - at merge-upload time for partners flagged
+          ``OVID_BUILDS_LDS_ADDRESS_HISTORY = True`` (emy, tmh), and
+        - at fix time via ``append_to_existing_lds_address_hx_fix`` v2.0 for
+          full-refresh (``no_merge``) partners that still need the address
+          history carried across cycles (nch).
 
-        The result is the full reconciled table intended to *overwrite* the
-        merged output schema for this table (not to be anti-join-unioned again).
+        Because the rows are rebuilt every cycle, a plain primary-key anti-join
+        merge (see :meth:`merge_dfs`) cannot express address moves and loses
+        patients that drop out of the current build. Rules, per ``PATID``
+        (ZIP comparisons are NULL-safe on ``ADDRESS_ZIP5``; "current" means
+        ``CURRENT_ADDRESS_FLAG`` is not ``'N'``):
+
+        1. **Continuation** - an incoming row whose (PATID, ZIP5) matches an
+           existing current row is dropped; the existing row (and its
+           ``ADDRESSID``) is kept and its period is widened: the earlier
+           non-null ``ADDRESS_PERIOD_START`` wins and a non-null
+           ``ADDRESS_PERIOD_END`` is extended to the later end date (an open,
+           NULL end stays open).
+        2. **Move** - an existing current row for a PATID that appears in the
+           incoming data with no incoming row of the same ZIP is closed:
+           ``ADDRESS_PERIOD_END`` is set to the patient's latest incoming
+           ``ADDRESS_PERIOD_START`` (never earlier than its own start, never
+           later than an existing end) and ``CURRENT_ADDRESS_FLAG`` = ``'N'``.
+           The incoming new-ZIP row is kept as a new row.
+        3. **ADDRESSID collision** - when a kept incoming row reuses an
+           existing ``ADDRESSID`` (e.g. ADDRESSID derived from a stable
+           ENCOUNTERID while the ZIP changed), the incoming row keeps the
+           ``ADDRESSID`` (it is the one the current geocode references) and the
+           existing row is re-keyed to a deterministic
+           ``md5('closed|ADDRESSID|ZIP5|START')`` id so the primary key stays
+           unique.
+        4. Existing rows for patients absent from the incoming data, and
+           existing rows already closed (``'N'``), are carried through
+           unchanged; incoming rows for new patients are added.
+        5. Optional (``enforce_single_current=True``): after reconciling, at
+           most one row per PATID keeps ``CURRENT_ADDRESS_FLAG='Y'`` - the row
+           with the latest start (then open/latest end, incoming before
+           existing, highest ADDRESSID); the others are flagged ``'N'``.
+
+        The result is the full reconciled table, intended to *replace* the
+        table (not to be anti-join-unioned again). Date columns keep the data
+        type of ``incoming_df`` (``DateType`` at upload time, ``yyyy-MM-dd``
+        strings at fix time).
 
         Args:
             incoming_df: The freshly built Ovid address-history DataFrame for
-                this batch (already schema-cast). Must contain at least
-                ``ADDRESSID``, ``PATID``, ``ADDRESS_ZIP5``, ``ADDRESS_PERIOD_START``
-                and ``ADDRESS_PERIOD_END``.
-            existing_df: The current address-history table read from the merge
-                (PUBLIC) schema, projected to the same columns as ``incoming_df``.
+                this batch. Must contain at least ``ADDRESSID``, ``PATID``,
+                ``ADDRESS_ZIP5``, ``ADDRESS_PERIOD_START`` and
+                ``ADDRESS_PERIOD_END``.
+            existing_df: The prior address-history table, with the same column
+                set (and date-column types) as ``incoming_df``.
+            enforce_single_current: When ``True``, keep only one current
+                (``'Y'``) row per PATID (rule 5). Only applied when the table
+                has a ``CURRENT_ADDRESS_FLAG`` column.
 
         Returns:
-            A DataFrame with the same columns as ``incoming_df`` containing the
-            reconciled rows: closed old rows, unchanged old rows, and surviving
-            incoming rows.
+            A DataFrame with the same columns (in the same order) as
+            ``incoming_df`` containing the reconciled rows.
 
         Raises:
             ValueError: If the two DataFrames do not share an identical column
@@ -5357,73 +5874,166 @@ class CommonFuncitons:
                 f"existing-only={set(existing_df.columns) - set(output_columns)}"
             )
 
-        existing_df = existing_df.select(*output_columns)
+        has_current_flag = "CURRENT_ADDRESS_FLAG" in output_columns
+        start_type = incoming_df.schema["ADDRESS_PERIOD_START"].dataType
+        end_type = incoming_df.schema["ADDRESS_PERIOD_END"].dataType
+        null_zip_key = "\u0000"
 
-        # 1) Drop incoming rows whose ADDRESSID already exists in the DB. The
-        #    existing row is authoritative for that primary key; a genuine move
-        #    must arrive with a new ADDRESSID.
-        surviving_incoming_df = incoming_df.join(
-            existing_df.select("ADDRESSID").distinct(),
-            on="ADDRESSID",
-            how="left_anti",
-        )
-
-        # 2) For each PATID, pick the "latest start" surviving incoming row as
-        #    the representative move (its ZIP and start date drive the close of
-        #    any existing row). Ties on start date are broken deterministically
-        #    by ADDRESSID so the choice is stable across runs.
-        latest_start_window = Window.partitionBy("PATID").orderBy(
-            to_date(col("ADDRESS_PERIOD_START"), "yyyy-MM-dd").desc_nulls_last(),
-            col("ADDRESSID").desc_nulls_last(),
-        )
-
-        latest_incoming_per_patid = (
-            surviving_incoming_df
-            .withColumn("_zip_rank", F.row_number().over(latest_start_window))
-            .filter(col("_zip_rank") == 1)
-            .select(
-                col("PATID").alias("_move_patid"),
-                col("ADDRESS_ZIP5").alias("_move_zip5"),
-                col("ADDRESS_PERIOD_START").alias("_move_period_start"),
+        def with_zip_key(data_frame: "pyspark.sql.DataFrame") -> "pyspark.sql.DataFrame":
+            """Add a NULL-safe ZIP5 join key column ``_zip_key``."""
+            return data_frame.withColumn(
+                "_zip_key", coalesce(col("ADDRESS_ZIP5").cast("string"), lit(null_zip_key))
             )
+
+        def as_date(column_name: str) -> Column:
+            """Parse a date column that may be DateType or a yyyy-MM-dd string."""
+            return to_date(col(column_name).cast("string"), "yyyy-MM-dd")
+
+        existing_keyed = with_zip_key(existing_df.select(*output_columns))
+        incoming_keyed = with_zip_key(incoming_df.select(*output_columns))
+
+        if has_current_flag:
+            existing_is_current = ~F.upper(
+                coalesce(col("CURRENT_ADDRESS_FLAG"), lit(""))
+            ).eqNullSafe(lit("N"))
+        else:
+            existing_is_current = lit(True)
+
+        existing_keyed = existing_keyed.withColumn("_is_current", existing_is_current)
+
+        # Per (PATID, ZIP) span of the incoming rows; its presence marks an
+        # existing row at the same ZIP as "continued" (rule 1).
+        incoming_zip_spans = incoming_keyed.groupBy("PATID", "_zip_key").agg(
+            F.min(as_date("ADDRESS_PERIOD_START")).alias("_in_min_start"),
+            F.max(as_date("ADDRESS_PERIOD_END")).alias("_in_max_end"),
+            lit(1).alias("_zip_seen"),
         )
 
-        # 3) Join existing rows to their patient's latest incoming move to detect
-        #    a ZIP change. A change is: the patient has an incoming move AND the
-        #    existing ZIP differs from the move ZIP (NULL-safe).
-        existing_with_move = existing_df.join(
-            latest_incoming_per_patid,
-            existing_df["PATID"] == latest_incoming_per_patid["_move_patid"],
-            how="left",
+        # Per PATID latest incoming start; its presence marks the patient as
+        # present in the incoming data, and its value closes moved rows (rule 2).
+        incoming_patid_latest = incoming_keyed.groupBy("PATID").agg(
+            F.max(as_date("ADDRESS_PERIOD_START")).alias("_in_latest_start"),
+            lit(1).alias("_patid_seen"),
         )
 
-        zip_changed_condition = (
-            col("_move_patid").isNotNull()
-            & ~col("ADDRESS_ZIP5").eqNullSafe(col("_move_zip5"))
+        current_existing_keys = (
+            existing_keyed.filter(col("_is_current"))
+            .select("PATID", "_zip_key")
+            .distinct()
         )
 
-        # 4) Existing rows with a ZIP change: close ADDRESS_PERIOD_END with the
-        #    incoming move's ADDRESS_PERIOD_START. Existing rows without a change
-        #    (or without any incoming move) are carried through unchanged.
-        reconciled_existing = existing_with_move.select(
+        # Rule 1: drop incoming rows that continue an existing current address.
+        surviving_incoming = incoming_keyed.join(
+            current_existing_keys, on=["PATID", "_zip_key"], how="left_anti"
+        )
+
+        existing_annotated = (
+            existing_keyed
+            .join(incoming_zip_spans, on=["PATID", "_zip_key"], how="left")
+            .join(incoming_patid_latest, on="PATID", how="left")
+        )
+
+        is_continued = col("_is_current") & col("_zip_seen").isNotNull()
+        is_moved = (
+            col("_is_current")
+            & col("_zip_seen").isNull()
+            & col("_patid_seen").isNotNull()
+        )
+
+        existing_start = as_date("ADDRESS_PERIOD_START")
+        existing_end = as_date("ADDRESS_PERIOD_END")
+
+        # F.least / F.greatest skip NULLs, so a missing existing start is
+        # filled from the incoming span.
+        continued_start = F.least(existing_start, col("_in_min_start"))
+        # A NULL (open) end on a current row stays open.
+        continued_end = when(
+            existing_end.isNull(), existing_end
+        ).otherwise(F.greatest(existing_end, col("_in_max_end")))
+        moved_end = F.greatest(
+            existing_start, F.least(existing_end, col("_in_latest_start"))
+        )
+
+        def date_out(date_column: Column, target_type: "pyspark.sql.types.DataType") -> Column:
+            """Render a computed DateType column back to the input column type."""
+            if isinstance(target_type, DateType):
+                return date_column
+            return date_format(date_column, "yyyy-MM-dd").cast(target_type)
+
+        new_start = when(is_continued, date_out(continued_start, start_type)).otherwise(
+            col("ADDRESS_PERIOD_START")
+        )
+        new_end = (
+            when(is_continued, date_out(continued_end, end_type))
+            .when(is_moved, date_out(moved_end, end_type))
+            .otherwise(col("ADDRESS_PERIOD_END"))
+        )
+
+        replacements: dict[str, Column] = {
+            "ADDRESS_PERIOD_START": new_start,
+            "ADDRESS_PERIOD_END": new_end,
+        }
+        if has_current_flag:
+            replacements["CURRENT_ADDRESS_FLAG"] = when(is_moved, lit("N")).otherwise(
+                col("CURRENT_ADDRESS_FLAG")
+            )
+
+        reconciled_existing = existing_annotated.select(
             *[
-                (
-                    when(zip_changed_condition, col("_move_period_start"))
-                    .otherwise(col("ADDRESS_PERIOD_END"))
-                    .alias("ADDRESS_PERIOD_END")
-                    if column_name == "ADDRESS_PERIOD_END"
-                    else col(column_name).alias(column_name)
-                )
+                replacements.get(column_name, col(column_name)).alias(column_name)
                 for column_name in output_columns
             ]
         )
 
-        # 5) Union reconciled existing rows with the surviving incoming rows.
-        final_df = reconciled_existing.select(*output_columns).unionByName(
-            surviving_incoming_df.select(*output_columns)
+        # Rule 3: re-key existing rows whose ADDRESSID is reused by a kept
+        # incoming row, so the primary key stays unique.
+        colliding_ids = (
+            surviving_incoming.select("ADDRESSID").distinct().withColumn("_id_collides", lit(1))
+        )
+        reconciled_existing = reconciled_existing.join(colliding_ids, on="ADDRESSID", how="left")
+        rekeyed_id = F.md5(
+            F.concat_ws(
+                "|",
+                lit("closed"),
+                col("ADDRESSID").cast("string"),
+                coalesce(col("ADDRESS_ZIP5").cast("string"), lit("")),
+                coalesce(col("ADDRESS_PERIOD_START").cast("string"), lit("")),
+            )
+        )
+        reconciled_existing = reconciled_existing.withColumn(
+            "ADDRESSID",
+            when(col("_id_collides").isNotNull(), rekeyed_id).otherwise(col("ADDRESSID")),
         )
 
-        return final_df
+        final_df = (
+            reconciled_existing.select(*output_columns).withColumn("_from_incoming", lit(0))
+            .unionByName(
+                surviving_incoming.select(*output_columns).withColumn("_from_incoming", lit(1))
+            )
+        )
+
+        # Rule 5: at most one current row per patient.
+        if enforce_single_current and has_current_flag:
+            is_flag_y = F.upper(coalesce(col("CURRENT_ADDRESS_FLAG"), lit(""))) == lit("Y")
+            current_rank_window = Window.partitionBy("PATID", "_is_y").orderBy(
+                as_date("ADDRESS_PERIOD_START").desc_nulls_last(),
+                as_date("ADDRESS_PERIOD_END").desc_nulls_first(),
+                col("_from_incoming").desc(),
+                col("ADDRESSID").desc_nulls_last(),
+            )
+            final_df = (
+                final_df
+                .withColumn("_is_y", is_flag_y)
+                .withColumn("_current_rank", F.row_number().over(current_rank_window))
+                .withColumn(
+                    "CURRENT_ADDRESS_FLAG",
+                    when(col("_is_y") & (col("_current_rank") > 1), lit("N")).otherwise(
+                        col("CURRENT_ADDRESS_FLAG")
+                    ),
+                )
+            )
+
+        return final_df.select(*output_columns)
 
 
 
@@ -6147,6 +6757,120 @@ class CommonFuncitons:
             spark.stop()            
             cls.print_with_style(str(e), 'danger red')
             raise
+
+
+
+###################################################################################################################################
+# Post-merge replication reconciliation (PCORnet DC 1.10)
+###################################################################################################################################
+
+    @classmethod
+    def reconcile_replication_post_merge(
+        cls,
+        db: str,
+        db_server: str,
+        merged_schema_name: str,
+    ) -> None:
+        """Re-synchronise ENC_TYPE and ADMIT_DATE in DIAGNOSIS/PROCEDURES after a merge.
+
+        The merge path (``db_upload_snowflake`` with ``upload_type == 'merge'``)
+        carries forward old PUBLIC rows whose primary key is absent from the new
+        batch via an ``INSERT ... WHERE NOT EXISTS``. Each table is merged on its
+        own primary key independently, so a corrected ENCOUNTER row (matched on
+        ENCOUNTERID) can win while old DIAGNOSIS/PROCEDURES rows (matched on
+        DIAGNOSISID/PROCEDURESID) carry forward untouched, still holding the stale
+        ENC_TYPE/ADMIT_DATE that were replicated at a previous fix stage. That
+        mismatch reproduces PCORnet Data Check 1.10 (replication errors between
+        ENCOUNTER, DIAGNOSIS and PROCEDURES) in the merged data.
+
+        This method runs once, after every table for a batch has been merged, and
+        overwrites ENC_TYPE and ADMIT_DATE in the merged DIAGNOSIS and PROCEDURES
+        tables with the authoritative values from the merged ENCOUNTER table
+        (matched on ENCOUNTERID). It is a no-op when the merged schema does not
+        contain the ENCOUNTER table or a given child table.
+
+        Args:
+            db: The Snowflake database that holds the merged schema.
+            db_server: The Snowflake account/server used by ``get_sf_connection``.
+            merged_schema_name: The merged schema name produced by
+                ``db_upload_snowflake`` (``OVID_<folder>_merged_with_<db>_<schema>``).
+
+        Returns:
+            None. Progress and per-table row counts are logged via ovid_logging;
+            errors are logged and re-raised.
+        """
+        logger = _get_ovid_logger()
+
+        conn = cls.get_sf_connection(db_server)
+        try:
+            cur = conn.cursor()
+            try:
+                # Confirm the authoritative ENCOUNTER table is present in the
+                # merged schema before attempting any child reconciliation. The
+                # database identifier is internal config (interpolated); the
+                # schema/table names are bound parameters.
+                table_exists_query = (
+                    f"SELECT COUNT(*) FROM {db}.INFORMATION_SCHEMA.TABLES "
+                    "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s"
+                )
+                cur.execute(
+                    table_exists_query,
+                    (merged_schema_name.upper(), "ENCOUNTER"),
+                )
+                if cur.fetchone()[0] == 0:
+                    logger.info(
+                        "reconcile_replication_post_merge: no ENCOUNTER table in "
+                        "%s.%s - skipping replication reconciliation",
+                        db, merged_schema_name,
+                    )
+                    return
+
+                for child_table in ("DIAGNOSIS", "PROCEDURES"):
+
+                    cur.execute(
+                        table_exists_query,
+                        (merged_schema_name.upper(), child_table),
+                    )
+                    if cur.fetchone()[0] == 0:
+                        logger.info(
+                            "reconcile_replication_post_merge: %s not present in "
+                            "%s.%s - skipping",
+                            child_table, db, merged_schema_name,
+                        )
+                        continue
+
+                    # NULL-safe comparison so rows are only rewritten when they
+                    # actually diverge from the merged ENCOUNTER row. Identifiers
+                    # (db/schema/table) are internal config, not user input.
+                    update_query = f"""
+                        UPDATE {db}.{merged_schema_name}.{child_table} AS tgt
+                        SET ENC_TYPE = enc.ENC_TYPE,
+                            ADMIT_DATE = enc.ADMIT_DATE
+                        FROM {db}.{merged_schema_name}.ENCOUNTER AS enc
+                        WHERE tgt.ENCOUNTERID = enc.ENCOUNTERID
+                          AND (
+                                NOT EQUAL_NULL(tgt.ENC_TYPE, enc.ENC_TYPE)
+                             OR NOT EQUAL_NULL(tgt.ADMIT_DATE, enc.ADMIT_DATE)
+                          )
+                    """
+                    cur.execute(update_query)
+                    rows_updated = cur.rowcount if cur.rowcount is not None else -1
+                    logger.info(
+                        "reconcile_replication_post_merge: reconciled %s rows in "
+                        "%s.%s.%s against merged ENCOUNTER",
+                        rows_updated, db, merged_schema_name, child_table,
+                    )
+
+            finally:
+                cur.close()
+        except Exception as exc:
+            logger.error(
+                "reconcile_replication_post_merge failed for %s.%s: %s",
+                db, merged_schema_name, exc, exc_info=True,
+            )
+            raise
+        finally:
+            conn.close()
 
 
 
@@ -7060,6 +7784,9 @@ class CommonFuncitons:
             .master(os.environ["SPARK_URL"]) \
             .appName(appName) \
             .config("spark.driver.memory", DEFAULT_SUBPROCESS_DRIVER_MEMORY) \
+            .config("spark.executor.memory", DEFAULT_SUBPROCESS_EXECUTOR_MEMORY) \
+            .config("spark.executor.extraJavaOptions", f"-Xss{DEFAULT_SPARK_THREAD_STACK_SIZE}") \
+            .config("spark.driver.extraJavaOptions", f"-Xss{DEFAULT_SPARK_THREAD_STACK_SIZE}") \
             .config("spark.sql.parquet.datetimeRebaseModeInRead", "LEGACY") \
             .config("spark.sql.adaptive.enabled", "true") \
             .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
@@ -7110,6 +7837,9 @@ class CommonFuncitons:
             _ovid_logger.error(f"FAILURE: Partner={partner}, Folder={folder}, Job={job} -- {text}")
         except Exception:
             pass  # Don't let logging failures break output
+
+        # Record the failure for apply_fix (private marker; no-op outside a fix).
+        cls._record_fix_failure(str(text))
 
         # Build the failure message string
         current_utc_datetime = datetime.utcnow()
@@ -7403,11 +8133,25 @@ class CommonFuncitons:
 # This 
 ###################################################################################################################################
     @classmethod
-    def get_field_config_snowflake(cls, field_name, field_data_type, spark):
+    def get_field_config_snowflake(cls, field_name, field_data_type, spark, field_size_overrides=None):
 
-  
+        """Build a Snowflake StructField for one CDM field.
 
+        Args:
+            field_name (str): CDM field name.
+            field_data_type (str): CDM RDBMS type string (e.g. ``RDBMS Text(x)``).
+            spark: Active SparkSession (unused, kept for signature compatibility).
+            field_size_overrides (Optional[dict[str, int]]): Optional per-run map
+                of ``field_name -> harmonized width``. When the field has an
+                undefined CDM length (``x`` notation, non-RAW) and an override is
+                supplied, the override wins over ``harmonized_filed_sizes_dict``.
+                Used to size empty complementary tables so their ID columns match
+                the width already present in the partner's populated tables
+                (PCORnet DC 1.15a field-length harmonization).
 
+        Returns:
+            StructField: The Snowflake field configuration.
+        """
 
         if 'RDBMS Text' in field_data_type:
 
@@ -7426,9 +8170,14 @@ class CommonFuncitons:
 
 
                     else:
-                    
 
-                        cdm_field_size = harmonized_filed_sizes_dict.get(field_name,20)
+                        # Prefer a per-run harmonized override (matches the width
+                        # already declared by this partner's populated tables) so
+                        # empty complementary tables do not diverge -> DC 1.15a.
+                        if field_size_overrides and field_name in field_size_overrides:
+                            cdm_field_size = field_size_overrides[field_name]
+                        else:
+                            cdm_field_size = harmonized_filed_sizes_dict.get(field_name,20)
                 
                 
 
@@ -7606,7 +8355,7 @@ class CommonFuncitons:
 # This function will get snowflake schema for a table
 ###################################################################################################################################
     @classmethod
-    def get_snowflake_schema(cls, table_name, spark, mappers_type=None):
+    def get_snowflake_schema(cls, table_name, spark, mappers_type=None, field_size_overrides=None):
 
             schema_sf = []
             cdm_df = PcornetCDM.get_cdm_df(spark)
@@ -7635,7 +8384,7 @@ class CommonFuncitons:
             for row in cdm_rows:
 
 
-                schema_sf.append( cls.get_field_config_snowflake(row["FIELD_NAME"],row["RDBMS_DATA_TYPE"] , spark) )
+                schema_sf.append( cls.get_field_config_snowflake(row["FIELD_NAME"],row["RDBMS_DATA_TYPE"] , spark, field_size_overrides=field_size_overrides) )
 
 
             schema_sf.append(StructField("UPDATED", StringType(), metadata={"maxlength":100}),)
@@ -7996,6 +8745,57 @@ class CommonFuncitons:
     # --- Failure flag (file-based, for subprocess to signal failure to parent) ---
 
     @classmethod
+    def _strip_ansi(cls, text: str) -> str:
+        """Remove ANSI SGR escape sequences from a string.
+
+        Failure-queue messages are stored with ANSI color/bold codes so they
+        render correctly on the terminal. When persisting those same messages
+        to the plain-text OVID log file the escape sequences are noise, so they
+        are stripped here.
+
+        Args:
+            text: The (possibly ANSI-styled) string to clean.
+
+        Returns:
+            The input string with all ``\\x1b[...m`` escape sequences removed.
+        """
+        import re
+        return re.sub(r'\x1b\[[0-9;]*m', '', text or '')
+
+    @classmethod
+    def _log_failure_messages(cls, failure_messages: list[tuple[str, str]]) -> None:
+        """Persist drained failure-queue messages to the OVID log file.
+
+        A subprocess (formatter/fixer/mapper) that catches its own exception and
+        calls :meth:`print_failure_message` writes the real error text to the
+        failure queue and then exits with code 0. Previously the timer thread
+        drained and cleared that queue on the failure path without ever writing
+        the text to the persistent log, so the concrete exception was lost (the
+        "fails silently" symptom). This helper logs each drained message at ERROR
+        level so the operational detail survives in the log file.
+
+        Args:
+            failure_messages: List of ``(message, text)`` tuples as returned by
+                :meth:`_poll_failure_queue`.
+
+        Returns:
+            None.
+        """
+        if not failure_messages:
+            return
+        try:
+            _ovid_logger = _get_ovid_logger()
+        except Exception:
+            return
+        for message, text in failure_messages:
+            clean_message = cls._strip_ansi(message).strip()
+            clean_text = cls._strip_ansi(text).strip()
+            if clean_text:
+                _ovid_logger.error(f"SUBPROCESS FAILURE: {clean_message} -- {clean_text}")
+            elif clean_message:
+                _ovid_logger.error(f"SUBPROCESS FAILURE: {clean_message}")
+
+    @classmethod
     def _get_failure_flag_path(cls):
         """Get path for failure flag file."""
         import os
@@ -8151,7 +8951,7 @@ class CommonFuncitons:
                     )
 
     @classmethod
-    def _poll_failure_queue(cls) -> list[tuple[str, str]]:
+    def _poll_failure_queue(cls, advance_cursor: bool = True) -> list[tuple[str, str]]:
         """Poll the failure queue for messages not yet consumed by this run.
 
         Mirrors ``_poll_fixer_queue``: files are read in sorted order and a
@@ -8159,6 +8959,13 @@ class CommonFuncitons:
         already-displayed failure is never re-emitted within a run. This makes
         correctness independent of whether the queue directory has been cleared,
         preventing the stale cross-run replay that produced mixed-date frames.
+
+        Args:
+            advance_cursor: When ``True`` (default) the consumed cursor is
+                advanced so callers on the display path do not re-render the
+                same failure. Pass ``False`` for read-only consumers (e.g.
+                logging in ``run_subprocess``) that must not starve the
+                subsequent display poll in ``resume_timer_after_subprocess``.
 
         Returns:
             A list of ``(message, text)`` tuples for newly seen failure files.
@@ -8188,7 +8995,8 @@ class CommonFuncitons:
                         f"Failed to read failure queue file: {path}", exc_info=True
                     )
 
-            cls._failure_lines_consumed = len(files)
+            if advance_cursor:
+                cls._failure_lines_consumed = len(files)
         except OSError:
             _get_ovid_logger().error(
                 "Failed to poll failure queue directory", exc_info=True
@@ -8245,8 +9053,49 @@ class CommonFuncitons:
             # stale cross-run replay that produced mixed-date frames). The parent
             # failure path (print_failure_message) renders directly into
             # _display_lines, so consuming here does not drop any display.
+            #
+            # A subprocess-originated failure, however, ONLY exists in the queue
+            # (the formatter caught its own exception, wrote the real error text
+            # to the queue, and exited 0). Draining without logging discarded
+            # that text -- the "fails silently" symptom. Log the drained messages
+            # to the persistent OVID log before clearing so the concrete error is
+            # never lost.
+            #
+            # Logging alone is not enough: this timer-thread branch fires (~10x/s)
+            # before run_formatter's post-subprocess resume_timer_after_subprocess()
+            # gets a chance, so it consumes and clears the queue first. Previously
+            # it returned without inserting the messages into _display_lines or
+            # calling _render(), so the styled error text reached the log but NEVER
+            # the terminal ("errors don't display"). We now render the drained
+            # failure messages into the live display here -- mirroring the normal
+            # path (below) and resume_timer_after_subprocess() -- before clearing.
             try:
-                cls._poll_failure_queue()
+                drained_failures = cls._poll_failure_queue()
+                cls._log_failure_messages(drained_failures)
+                if drained_failures:
+                    try:
+                        job_time_str, total_time_str = cls._build_time_strings()
+                    except Exception:
+                        job_time_str, total_time_str = "00:00.0", "00:00.0"
+                    # Ensure the display buffer exists so we have somewhere to
+                    # insert the failure lines (it normally does, but rebuild
+                    # defensively to match resume_timer_after_subprocess()).
+                    existing_fixer_lines = cls._get_current_fixer_lines()
+                    cls._rebuild_display_lines(
+                        job_time_str,
+                        total_time_str,
+                        existing_fixer_lines if existing_fixer_lines else None,
+                    )
+                    for msg, text in drained_failures:
+                        # The blank separator is second-to-last, total elapsed is
+                        # last; insert the failure lines just before the separator.
+                        separator_idx = len(cls._display_lines) - 2
+                        if separator_idx < 1:
+                            separator_idx = 1
+                        cls._display_lines.insert(separator_idx, msg)
+                        if text:
+                            cls._display_lines.insert(separator_idx + 1, text)
+                    cls._render()
                 cls._clear_failure_queue()
             except OSError:
                 _get_ovid_logger().error(
@@ -8280,6 +9129,9 @@ class CommonFuncitons:
         # If there are failure messages, add them to the display buffer
         # (insert before the blank separator line)
         if failure_messages:
+            # Persist to the log as well as the display so the error text
+            # survives after the transient queue is cleared.
+            cls._log_failure_messages(failure_messages)
             for msg, text in failure_messages:
                 # The blank separator is second-to-last, total elapsed is last
                 separator_idx = len(cls._display_lines) - 2
@@ -8589,7 +9441,29 @@ class CommonFuncitons:
                 cls._display_lines.insert(separator_idx, styled_message)
                 cls._display_lines.insert(separator_idx + 1, styled_text)
                 cls._render()
-        
+        elif cls._check_failure_flag():
+            # The subprocess signalled failure itself (it caught its own
+            # exception, called print_failure_message() -- which sets the flag
+            # and enqueues the real error text -- and then exited, often with
+            # code 0). run_subprocess therefore takes neither the success path
+            # nor the branch above. Drain the queued failure text and persist it
+            # to the log so the concrete error is recorded even though the child
+            # returned "success". The messages are left in the queue for the
+            # display/timer path to render; _log_failure_messages only reads.
+            try:
+                queued_failures = cls._poll_failure_queue(advance_cursor=False)
+                cls._log_failure_messages(queued_failures)
+            except OSError:
+                if _ovid_logger:
+                    _ovid_logger.error(
+                        "Failed to read failure queue in run_subprocess", exc_info=True
+                    )
+            if _ovid_logger:
+                _ovid_logger.error(
+                    "Subprocess reported failure via failure flag "
+                    f"(return code {result.returncode})"
+                )
+
         return result
 
 ###################################################################################################################################

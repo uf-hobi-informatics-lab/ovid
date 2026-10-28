@@ -31,7 +31,8 @@ input_data_folder = args.data_folder
 
 fixes = {
 
-    # "1": {"fix_type":"common",    "fix_name":"patid_orphans_fix",   "version":"1.0", "src1":"mapped_demographic.csv", "src2":"NotUsed"},
+    # Derives the 8 PCORnet v7.0 RACE_ETH_* columns from RACE / HISPANIC.
+    "1": {"fix_type":"common",    "fix_name":"race_eth_fix",   "version":"1.0", "src1":"RACE", "src2":"HISPANIC"},
     # "2": {"fix_type":"common",    "fix_name":"replication_fix",     "version":"1.0", "src1":"mapped_encounter.csv",   "src2":"NotUsed"},
     # "3": {"fix_type":"custom",    "fix_name":"replication_fix",     "version":"1.0", "src1":"mapped_encounter.csv",   "src2":"NotUsed"},
 

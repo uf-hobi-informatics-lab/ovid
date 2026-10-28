@@ -7,7 +7,8 @@ common/ovid_secrets.py
 ovid_setup/install_settings.py
 common/cdm/omop_5_3/*.csv
 
-# Large reference data that ships separately (too big for git)
+# Large reference data. The geocoding reference is committed gzip-compressed
+# (FULL_GEOCODING_*.csv.gz); an optional local decompressed copy stays untracked.
 common/lists/FULL_GEOCODING_*.csv
 common/omop_cdm/*.csv
 

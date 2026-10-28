@@ -827,6 +827,42 @@ def run_upload_jobs(folder):
                 print(f"Expected path: {fixed_files_path}")
                 print("Please ensure the fix job has been run for these tables before upload.\n")
 
+        # After every table for this batch has merged, re-synchronise ENC_TYPE
+        # and ADMIT_DATE in the merged DIAGNOSIS/PROCEDURES tables against the
+        # merged ENCOUNTER table. The per-table INSERT ... WHERE NOT EXISTS merge
+        # can carry forward stale replicated values in the child tables while a
+        # corrected ENCOUNTER row wins, reproducing PCORnet DC 1.10. Running this
+        # once as a final pass avoids depending on ENCOUNTER being uploaded
+        # before its children. Only applies to Snowflake merge uploads.
+        if input_upload_type == 'merge' and input_db_type and input_db_type.upper() == 'SF':
+
+            schema_folder_name = folder.split('/')[1] if '/' in folder else folder
+            merged_schema_name = f"OVID_{schema_folder_name}_merged_with_{input_merge_db}_{input_merge_schema}"
+
+            cf.print_run_status(
+                job_num, total_jobs_count,
+                f"reconciling replication (ENC_TYPE/ADMIT_DATE) in {merged_schema_name}",
+                folder, input_partner,
+            )
+
+            try:
+                cf.reconcile_replication_post_merge(
+                    db=input_db,
+                    db_server=input_db_server,
+                    merged_schema_name=merged_schema_name,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Post-merge replication reconciliation failed for {merged_schema_name}: {e}",
+                    exc_info=True,
+                )
+                cf.print_failure_message(
+                    folder=folder,
+                    partner=input_partner,
+                    job='reconcile_replication_post_merge',
+                    text=str(e),
+                )
+
 
 
 
