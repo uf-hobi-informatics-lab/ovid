@@ -72,7 +72,7 @@ def setup_logging(
 
     Args:
         timestamp: Timestamp string in format %Y%m%d-%H%M%S (same as Spark master name)
-        partner: Partner code (e.g., 'avh', 'ufh', 'tmc')
+        partner: Partner code (e.g., 'partnera')
         log_level: Logging level (default: logging.INFO)
         console_output: Whether to also output logs to console (default: False)
         base_dir: Base directory for log files (auto-detected if None)

@@ -190,7 +190,7 @@ def run_fix_chain(cf: CommonFuncitons, spark: SparkSession, partner_name: str, i
     Args:
         cf: CommonFuncitons instance.
         spark: Active SparkSession.
-        partner_name: Partner name, e.g. ``umn``.
+        partner_name: Partner name, e.g. ``partnera``.
         input_data_folder: Batch folder, e.g. ``PARTNER/20260915``.
         mapped_table_name: Mapped table file name, e.g. ``mapped_obs_clin.csv``.
         fixed_table_name: Fixed table file name, e.g. ``fixed_obs_clin.csv``.
@@ -287,7 +287,7 @@ def run_partner_fixes(partner_name: str, input_data_folder: str, mapped_table_na
     """Entry point for partner ``<table>_fixer.py`` scripts.
 
     Args:
-        partner_name: Partner name, e.g. ``umn``.
+        partner_name: Partner name, e.g. ``partnera``.
         input_data_folder: Batch folder, e.g. ``PARTNER/20260915``.
         mapped_table_name: Mapped table file name.
         fixed_table_name: Fixed table file name.

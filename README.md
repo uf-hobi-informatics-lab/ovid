@@ -9,7 +9,7 @@ Last Updated: 10/28/2026
 
 # Ovid
 
-Ovid is a PySpark-based ETL (Extract, Transform, Load) pipeline designed for transforming and harmonizing healthcare data into standardized Common Data Models (CDM), including PCORnet and OMOP formats. The tool automates the process of ingesting raw partner data, applying formatting rules, deduplication, mapping to standard vocabularies, data quality checks, and uploading to a centralized data warehouse.
+Ovid is a PySpark-based ETL (Extract, Transform, Load) pipeline designed for transforming and harmonizing healthcare data into standardized Common Data Models (CDM), including PCORnet and OMOP formats. The tool automates the process of ingesting raw partner data, applying formatting rules, deduplication, mapping to standard vocabularies, data quality checks, and writing the final CDM tables as tab-delimited files (`fixed_{table}.csv`), which can optionally be uploaded to a data warehouse (Snowflake).
 
 ## Workflow
 
@@ -26,7 +26,13 @@ The typical Ovid workflow consists of the following stages:
 2. **Deduplicate**: Removes duplicate records from the formatted data
 3. **Map**: Maps source values to standard vocabularies and CDM conventions
 4. **Fix**: Applies partner-specific fixes and corrections to the mapped data
-5. **Upload**: Uploads the final processed data to the target database (Snowflake)
+5. **Upload** *(optional)*: Uploads the final processed data to the target database (Snowflake)
+
+**Snowflake is optional.** Stages 1–4 write plain files to disk, and the
+**`fixed_{table}.csv` files written by the Fix stage are the final PCORnet CDM
+output**. Teams that only need the converted files, or that load them into
+another database (Oracle, PostgreSQL, SQL Server, ...), can stop after `fix`.
+See [Running without Snowflake (file output only)](#running-without-snowflake-file-output-only).
 
 Additional pipelines are available for:
 - **Analysis**: Generate monthly counts and distinct value reports
@@ -39,7 +45,12 @@ This tool requires Docker to be installed. Ovid automatically provisions an ephe
 
 ## Supported Databases
 
-**Currently, Ovid only supports Snowflake for database uploads.** Support for PostgreSQL and Microsoft SQL Server is planned for future implementation.
+**A database is not required to convert data.** The `upload` job is the only
+ETL stage that connects to a database, and Snowflake is currently the only
+supported upload target. Support for PostgreSQL and Microsoft SQL Server is
+planned for future implementation. To use another database, run the ETL up to
+`fix` and load the `fixed_*.csv` files yourself (see
+[Running without Snowflake](#running-without-snowflake-file-output-only)).
 
 
 # Installation
@@ -54,7 +65,7 @@ Before installing Ovid, you must configure the installation settings:
    - **General**: Set `PYSPARK_WORKERS_COUNT`
    - **Paths**: Set `CREDENTIALS_PATH`, `OVID_INSTALL_PATH`, and `OMOP_CONCEPT_TABLES_PATH`
    - **Database settings**: Configure `DB_TYPE`, `DB_SERVER_NAME`
-   - **Snowflake settings**: Configure `SF_STAGE_NAME`, `SF_ROLE`, `SF_DB_USER`, `SF_WAREHOUSE`, `SF_PRIVATE_KEY_FILE_NAME`, and `SF_PRIVATE_KEY_PASSPHRASE_FILE_NAME`
+   - **Snowflake settings** (only needed for the `upload` job and the scheduler; leave the placeholders if you only need file output): Configure `SF_STAGE_NAME`, `SF_ROLE`, `SF_DB_USER`, `SF_WAREHOUSE`, `SF_PRIVATE_KEY_FILE_NAME`, and `SF_PRIVATE_KEY_PASSPHRASE_FILE_NAME`
    - **Encryption settings**: Set `SEED_FILE_NAME`
    - **Datavant settings**: Configure `DV_CREDENTIALS_FILE_NAME` and `DV_TRANSFORMATION_SCRIPT_FILE_NAME`
 
@@ -232,6 +243,70 @@ The job will be `map`, not `all`, because command-line arguments take priority.
         python3 ovid.py etl -p partnerA -f q2_2023 -t demographic encounter -j format map
 
 
+## Running without Snowflake (file output only)
+
+Snowflake is only used by the `upload` job. If you only need the converted
+PCORnet CDM files, or you plan to load them into another database (Oracle,
+PostgreSQL, SQL Server, ...), run the four file-producing stages and leave out
+`upload`:
+
+        python3 ovid.py etl -p [partner_name] -f [folder_name] -t all -j format deduplicate map fix
+
+                e.g.   python3 ovid.py etl -p partnerA -f q2_2023 -t all -j format deduplicate map fix
+
+Do **not** use `-j all` for this: `all` includes `upload`. The `-s`, `-db`,
+`-dt`, `-ut`, `-mdb` and `-ms` options are not needed.
+
+### Final output: the `fixed_*` tables
+
+The **final PCORnet CDM output is the set of `fixed_{table}.csv` files** written
+by the Fix stage:
+
+        partners/[partner_name]/data/[folder_name]/fixer_output/fixed_{table}.csv
+
+                e.g.   partners/partnerA/data/q2_2023/fixer_output/fixed_demographic.csv
+                       partners/partnerA/data/q2_2023/fixer_output/fixed_encounter.csv
+                       partners/partnerA/data/q2_2023/fixer_output/fixed_diagnosis.csv
+
+These are the same files the `upload` job would send to Snowflake (it uploads
+every `fixed_*.csv` in `fixer_output/`). Use these files, and **not** the
+intermediate `formatted_*`, `deduplicated_*` or `mapped_*` files, as the
+deliverable. The intermediate outputs have not had the fixes applied yet
+(orphan removal, date corrections, valueset enforcement, race/ethnicity
+derivation, ...).
+
+File format:
+
+- **Tab-delimited** (`\t`), one header row with the PCORnet CDM column names,
+  no quote characters.
+- Missing values are empty fields.
+- Patient and record identifiers (`PATID`, `ENCOUNTERID`, ...) are hashed by
+  the mappers with the encryption seed (`SEED_FILE_NAME`).
+
+When loading into another database, declare the delimiter as tab and treat
+empty fields as `NULL`. For example, with Oracle SQL\*Loader use
+`FIELDS TERMINATED BY X'09' TRAILING NULLCOLS` and skip the header row
+(`OPTIONS (SKIP=1)`). Column names and types for each table are listed in the
+PCORnet CDM v7.0 specification (`common/cdm/pcornet_7_0/pcornet_cdm_v70.csv`).
+
+### Configuration when not using Snowflake
+
+The installer still creates `common/ovid_secrets.py`, which Ovid imports at
+startup. If you never run `upload`:
+
+- In `ovid_setup/install_settings.py`, leave the `SF_*` / `DB_SERVER_NAME`
+  values as placeholders. They are only read by the `upload` job, the
+  scheduler, and `tools raw_upload`.
+- You **do** need the encryption seed file (`SEED_FILE_NAME` in
+  `CREDENTIALS_PATH`). The mappers use it to hash identifiers.
+- Datavant settings are only needed for Datavant token matching.
+- Avoid the common fixes that read the existing data from Snowflake (for
+  example `append_to_existing_lds_address_hx_fix`). The partner templates do
+  not enable them.
+- The scheduler keeps its batch state in Snowflake. For a file-only setup, run
+  `python3 ovid.py etl` directly.
+
+
 # Analysis Pipeline
 
 ## To run monthly counts:
@@ -279,12 +354,12 @@ The job will be `map`, not `all`, because command-line arguments take priority.
 
 | Parameter | Description |
 |-----------|-------------|
-| `-p, --partner` | Partner or site name (required). Used to pull partner/site custom dictionaries (e.g., usf, uab) |
+| `-p, --partner` | Partner or site name (required). Used to pull partner/site custom dictionaries (e.g., partnera) |
 | `-f, --ovid_input_folder` | Input folder name(s) where raw data resides (required) |
 | `-t, --table` | Table name(s) to run the job on (e.g., demographic, encounter, or all) |
-| `-j, --job` | Job type: `all`, `format`, `deduplicate`, `map`, `fix`, `upload` |
-| `-s, --db_server` | Database server address or Snowflake account |
-| `-db, --db_name` | Database name for upload |
+| `-j, --job` | Job type: `all`, `format`, `deduplicate`, `map`, `fix`, `upload`. `all` includes `upload`; use `format deduplicate map fix` for file output only |
+| `-s, --db_server` | Database server address or Snowflake account (`upload` only) |
+| `-db, --db_name` | Database name for upload (`upload` only) |
 | `-dt, --database_type` | Database type: `sf` (Snowflake). **Note: Only Snowflake is currently supported. PostgreSQL (`pg`) and Microsoft SQL Server (`mssql`) are planned for future implementation.** |
 | `-id, --input_directory` | Path to the data parent folder |
 | `-wc, --workers_count` | Number of Spark workers |

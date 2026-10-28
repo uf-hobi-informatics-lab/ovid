@@ -268,7 +268,7 @@ def create_master_docker_compose(input_directory, enable_ui_binding=False):
     os.chmod(spark_tmp_dir, 0o777)
     os.chmod('work_directory/docker_data/ovid_logs', 0o777)
     
-    host_ip = "10.44.4.4"
+    host_ip = SPARK_PUBLIC_HOST
     output_file = compose_file_master
     workdir = '../'
     outdir = '../'
@@ -347,7 +347,7 @@ def create_workers_docker_compose(input_directory, workers_count, enable_ui_bind
     """Create docker-compose file with only workers (connects to existing master)."""
     logger = get_logger()
     
-    host_ip = "10.44.4.4"
+    host_ip = SPARK_PUBLIC_HOST
     output_file = compose_file_workers
     workdir = '../'
     outdir = '../'
@@ -484,7 +484,7 @@ def create_docker_compose(input_directory, workers_count, enable_ui_binding=Fals
         except PermissionError:
             logger.warning(f"Could not change permissions on {path} - directory may be owned by another user")
     
-    host_ip = "10.44.4.4"
+    host_ip = SPARK_PUBLIC_HOST
     output_file = compose_file
     workdir = '../'
     outdir = '../'
@@ -660,7 +660,7 @@ def run_ovid_etl(args):
             --conf spark.sql.adaptive.enabled=true\
             --conf 'spark.driver.extraJavaOptions=-Dlog4j.configuration=file:///app/common/log4j-quiet.properties' \
             --master spark://{master_name}:7077 \
-            --py-files {common_zip_name}   /app/pipelines/{args.command}.py  -f {' '.join(args.ovid_input_folder)} -p {args.partner}  -j {jobs}  -t {tables} -db {db_name} -dt {db_type} -s {db_server} -ut {upload_type} -mdb {merge_db_name} -ms {merge_schema_name} ; \
+            --py-files {common_zip_name}   /app/pipelines/{args.command}.py  -f {' '.join(args.ovid_input_folder)} -p {args.partner}  -j {jobs}  -t {tables} -db '{db_name}' -dt '{db_type}' -s '{db_server}' -ut '{upload_type}' -mdb '{merge_db_name}' -ms '{merge_schema_name}' ; \
         rm -f {common_zip_name}
             "
         """
@@ -853,7 +853,7 @@ def run_ovid_tools(args):
             --conf spark.sql.adaptive.enabled=true\
             --conf 'spark.driver.extraJavaOptions=-Dlog4j.configuration=file:///app/common/log4j-quiet.properties' \
             --master spark://{master_name}:7077 \
-            --py-files {common_zip_name}   /app/pipelines/{args.command}.py  -f {' '.join(args.ovid_input_folder)} -p {args.partner}  -j {jobs}  -t {tables} -db {db_name} -dt {db_type} -s {db_server} ; \
+            --py-files {common_zip_name}   /app/pipelines/{args.command}.py  -f {' '.join(args.ovid_input_folder)} -p {args.partner}  -j {jobs}  -t {tables} -db '{db_name}' -dt '{db_type}' -s '{db_server}' ; \
         rm -f {common_zip_name}
             "
         """

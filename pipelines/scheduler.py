@@ -230,11 +230,11 @@ def _host_path_for_partner_data(container_path: str) -> str:
 
     Args:
         container_path: An absolute path the in-container ETL would see,
-            e.g. '/data/EMY/20260610' or '/data/EMY/20260610/file.csv'.
+            e.g. '/data/PARTNER/20260610' or '/data/PARTNER/20260610/file.csv'.
 
     Returns:
         The corresponding path on the host filesystem, e.g.
-        '/data/inboxarchive/EMY/20260610'. Inputs that don't begin with
+        '/data/inboxarchive/PARTNER/20260610'. Inputs that don't begin with
         '/data/' are returned unchanged so this helper is safe to call on
         arbitrary path strings (operator-edited DB rows, future code paths
         that already pass host paths, etc.).
@@ -711,7 +711,7 @@ def fetch_new_jobs() -> list[dict]:
 
             # Gate out phantom batches: folders that are empty or contain
             # only archives (e.g. the empty YYYYMMDD.tar.gz an external
-            # nightly cron drops into UFH) hold no ETL-usable input, so
+            # nightly cron drops into a partner folder) hold no ETL-usable input, so
             # they must never become a NEW batch. Without this check they
             # run a full no-op ETL and email an all-not_found report every
             # night. See _folder_has_eligible_input() (2026-09-08 fix).
@@ -749,7 +749,7 @@ def _resolve_partner_input_tables(partner: str) -> list[str]:
     When absent, returns ``["all"]`` to preserve the historical behavior
     every other partner relies on.
 
-    The primary use case is hash-token-only partners (JHS, 2026-08-03).
+    The primary use case is hash-token-only partners.
     Without this restriction the shared ``mapping_scripts/pcornet_mappers/``
     step fires all 26 mappers per batch and logs 25 spurious
     ``deduplicated file not found`` failures for the tables the partner
@@ -757,7 +757,7 @@ def _resolve_partner_input_tables(partner: str) -> list[str]:
     ``partner_settings.py``.
 
     Args:
-        partner: Lowercase partner code (e.g. ``"jhs"``).
+        partner: Lowercase partner code (e.g. ``"partnera"``).
 
     Returns:
         A list of argv-ready table names to pass to the downstream
@@ -794,7 +794,7 @@ def _build_job_dict(
 
     Honors the optional ``INPUT_TABLES`` attribute in the partner's
     ``partner_settings.py`` via :func:`_resolve_partner_input_tables`.
-    Hash-token-only partners (JHS as of 2026-08-03) use that hook to
+    Hash-token-only partners use that hook to
     prevent the ETL pipeline from iterating all 26 pcornet mappers per
     batch. Every other partner has no ``INPUT_TABLES`` attribute and
     receives the historical ``"all"`` value unchanged.
@@ -870,7 +870,7 @@ def resolve_cdm_count_location(
     reflects the authoritative, queryable location of the CDM data.
 
     Args:
-        partner: Lower-case partner slug (e.g. ``"tmh"``).
+        partner: Lower-case partner slug (e.g. ``"partnera"``).
         folder: The batch data folder / date token (e.g. ``"20260911"``).
         default_db: Fallback database when the partner defines no merge
             database (used for the ``no_merge`` path).
@@ -1132,8 +1132,8 @@ def _list_raw_upload_files(raw_input_dir: str) -> list[str]:
         # crash discovery. Some archived partner folders under
         # /data/inboxarchive/ are owned by root with no world-read bit;
         # walking one of them used to abort the entire scan and starve
-        # every partner alphabetically after it (e.g. uci/umi/umn/usf/vrt
-        # after ufh). Log and treat as no eligible input.
+        # every partner alphabetically after it (i.e. every
+        # later partner). Log and treat as no eligible input.
         _logger.warning(
             f"Could not list raw input files in {raw_input_dir}; "
             f"treating as no eligible input",
@@ -1208,7 +1208,7 @@ def _folder_has_eligible_input(host_folder_path: str) -> bool:
 
     The scheduler treats every subfolder of a partner directory as a
     candidate batch, but an external nightly cron drops empty
-    ``YYYYMMDD.tar.gz`` archives into fresh UFH folders (observed
+    ``YYYYMMDD.tar.gz`` archives into fresh partner folders (observed
     2026-09-08). Those archives are never extracted by the ETL, so the
     pipeline produces zero tables, marks the batch PROCESSED, and emails
     an all-``not_found`` report every night. This helper is the gate that
@@ -1606,7 +1606,7 @@ def run_batch(slot_index: int, job: dict[str, Any]) -> None:
     # `ovid_tables` is a list produced by _build_job_dict via
     # _resolve_partner_input_tables. It is ["all"] for every partner that
     # ships a full PCORnet CDM (24 of 25 partners as of 2026-08-03) and
-    # ["hash_token"] for JHS. Legacy code paths that stored a bare string
+    # ["hash_token"] for hash-token-only partners. Legacy code paths that stored a bare string
     # are tolerated by wrapping non-list values in a single-element list.
     raw_tables = job.get("ovid_tables", "all")
     if isinstance(raw_tables, str):
@@ -2007,7 +2007,7 @@ def _batch_produced_no_output(batch_info: dict[str, Any]) -> bool:
     clean exit (status PROCESSED) but every CDM table is ``not_found`` in
     Snowflake AND the raw_upload stage uploaded nothing. It occurs when a
     batch folder held no ETL-usable input — e.g. the empty
-    ``YYYYMMDD.tar.gz`` an external cron drops into UFH nightly.
+    ``YYYYMMDD.tar.gz`` an external cron drops into a partner folder nightly.
 
     :func:`fetch_new_jobs` already gates such folders out via
     :func:`_folder_has_eligible_input`, so this is a defence-in-depth

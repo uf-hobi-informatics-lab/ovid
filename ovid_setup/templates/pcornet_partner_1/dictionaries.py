@@ -5890,7 +5890,7 @@ lab_result_cm_abn_ind_dict = {
 
 # To create the units mappings from lab_result:
 #  SELECT concat('"',replace(replace(RAW_UNIT, '}', '}'), '{', '{') collate SQL_Latin1_General_CP1_CS_AS,'":"', replace(replace(RESULT_UNIT, '}', '}'), '{', '{'),'",')
-#   FROM [CHAR_USF].[dbo].[lab_result_cm] group by  RAW_UNIT, RESULT_UNIT order by count(*) desc
+#   FROM [YOUR_CDM_DB].[dbo].[lab_result_cm] group by  RAW_UNIT, RESULT_UNIT order by count(*) desc
 
 
 

@@ -182,7 +182,7 @@ try:
 
     ###################################################################################################################################
 
-    cf =CommonFuncitons('UFH')
+    cf =CommonFuncitons(partner_name)
     cf.write_pyspark_output_file(
                         payspark_df = obs_clin,
                         output_file_name = "formatted_obs_clin.csv",

@@ -633,7 +633,7 @@ def run_upload_jobs(folder):
                 table_name = file_name.replace('fixed_',"").replace('.csv',"")
 
                 job_num = job_num +1
-                # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                # Extract date from folder (e.g., "PARTNER/20251224" -> "20251224")
                 schema_date = folder.split('/')[-1] if '/' in folder else folder
                 cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table_name.upper()}", folder, input_partner)
 
@@ -671,7 +671,7 @@ def run_upload_jobs(folder):
                     if os.path.exists(fixed_files_path+fixed_table_name):
 
                         job_num = job_num +1
-                        # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                        # Extract date from folder (e.g., "PARTNER/20251224" -> "20251224")
                         schema_date = folder.split('/')[-1] if '/' in folder else folder
                         cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table.upper()}", folder, input_partner)
 

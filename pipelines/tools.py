@@ -11,7 +11,7 @@ Currently exposes one job:
 
 The tools pipeline is invoked from the host orchestrator via::
 
-    python3 ovid.py tools -j raw_upload -p emy -f EMY/20260319 -t all
+    python3 ovid.py tools -j raw_upload -p partnera -f PARTNER/20260319 -t all
 
 See ``common/commonFunctions.py:db_upload_raw`` for the per-file upload
 implementation, and ``common/commonFunctions.py:_raw_dv_match_files`` for
@@ -247,7 +247,7 @@ def run_raw_upload_jobs(folder: str) -> None:
     cluster, so host-side parallelism would not help.
 
     Args:
-        folder: Folder identifier (e.g. ``EMY/20260319``). Maps to the
+        folder: Folder identifier (e.g. ``PARTNER/20260319``). Maps to the
             ``/data/{folder}/`` mount inside the Spark master container.
     """
     global job_num

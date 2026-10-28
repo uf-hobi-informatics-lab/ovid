@@ -716,7 +716,7 @@ def run_upload_jobs(folder):
                 table_name = file_name.replace('fixed_',"").replace('.csv',"")
 
                 job_num = job_num +1
-                # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                # Extract date from folder (e.g., "PARTNER/20251224" -> "20251224")
                 schema_date = folder.split('/')[-1] if '/' in folder else folder
                 cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table_name.upper()}", folder, input_partner)
 
@@ -768,7 +768,7 @@ def run_upload_jobs(folder):
                     if os.path.exists(fixed_files_path+fixed_table_name):
 
                         job_num = job_num +1
-                        # Extract date from folder (e.g., "BND/20251224" -> "20251224")
+                        # Extract date from folder (e.g., "PARTNER/20251224" -> "20251224")
                         schema_date = folder.split('/')[-1] if '/' in folder else folder
                         cf.print_run_status(job_num,total_jobs_count, f"uploading to {input_db.upper()}.OVID_{schema_date.upper()}.{table.upper()}", folder, input_partner)
 
@@ -1092,7 +1092,7 @@ def run_distinct_values_jobs(folder):
 # end -- so the scheduler's `result.returncode` correctly reflects
 # whether the batch actually completed end-to-end.
 #
-# Why this exists: the EMY 20260610 batch demonstrated a class of
+# Why this exists: a past production batch demonstrated a class of
 # silent-PROCESSED bugs. Helpers like cf.deduplicate() catch
 # exceptions internally (commonFunctions.py:867) and call
 # print_with_style(...) which writes only to the terminal -- the
@@ -1197,8 +1197,8 @@ print("""
 #   2. cf._check_failure_flag() -- a subprocess (formatter/fixer/mapper)
 #      wrote a failure message to the queue, OR print_failure_message()
 #      was invoked anywhere in the parent. This flag was already being
-#      set in many places but never consulted at exit -- the EMY
-#      20260610 batch is the canonical example: 4 formatters failed,
+#      set in many places but never consulted at exit -- in one past production batch
+#      for example: 4 formatters failed,
 #      the dedup phase silently failed for every table, and the parent
 #      still exited 0 because nothing checked the flag.
 _pipeline_failed = _etl_pipeline_had_uncaught_exception

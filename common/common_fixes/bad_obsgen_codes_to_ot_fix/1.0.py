@@ -7,7 +7,7 @@ and the target columns + replacement value are passed via ``src2`` as
 a comma-separated triple ``CODE_COLUMN,TYPE_COLUMN,TARGET_VALUE``.
 
 This fix was originally created to flip ``OBSGEN_TYPE`` to
-``"UD_LC_COMPONENT"`` on EMY OBS_GEN rows whose ``OBSGEN_CODE`` is in
+``"UD_LC_COMPONENT"`` on OBS_GEN rows whose ``OBSGEN_CODE`` is in
 the ``bad_obsgen_codes`` list (initial entry: LOINC ``LG41856-2``,
 "Smoking-related terms"), but the implementation is generic and can be
 reused for any (table, code-column, type-column, replacement-value)

@@ -164,7 +164,7 @@ try:
 
     ###################################################################################################################################
 
-    cf =CommonFuncitons('UFH')
+    cf =CommonFuncitons(partner_name)
     cf.write_pyspark_output_file(
                         payspark_df = encounter,
                         output_file_name = "formatted_encounter.csv",

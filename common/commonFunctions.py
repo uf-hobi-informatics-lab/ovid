@@ -1376,7 +1376,7 @@ class CommonFuncitons:
             file_name: Name of the input file (e.g. 'raw_formatted_hash_token.csv').
             output_file_path: Directory for the final combined output.
             folder: Data folder name (used for path construction).
-            partner: Partner name (e.g. 'vrt').
+            partner: Partner name (e.g. 'partnera').
 
         Returns:
             None.
@@ -1412,7 +1412,7 @@ class CommonFuncitons:
 
             # --- Resolve the input file, supporting glob patterns ---
             # vrt passes a concrete name ('raw_formatted_hash_token.csv'); the
-            # Shape-A partners pass a glob (e.g. '*ONEFL_UFH_HASH_TOKENS*.csv').
+            # Shape-A partners pass a glob (e.g. '*HASH_TOKENS*.csv').
             # Mirror the sequential function's glob.glob resolution so both work.
             candidate = os.path.join(input_file_path, file_name)
             if os.path.isfile(candidate):
@@ -1679,10 +1679,9 @@ class CommonFuncitons:
                               (e.g. ``/data/25r1/``).
             file_name       : Filename pattern (glob) for the raw hash_token
                               file, e.g. ``'*hash_token*.csv'`` or
-                              ``'*ONEFL_UFH_HASH_TOKENS*.csv'``.
+                              ``'*HASH_TOKENS*.csv'``.
             folder          : Data folder / batch tag (e.g. ``'25r1'``).
-            partner         : Lowercase partner code (e.g. ``'ufh'``,
-                              ``'umi'``).
+            partner         : Lowercase partner code (e.g. ``'partnera'``).
 
         Returns:
             None. All errors are logged via ovid_logging AND mirrored to
@@ -1761,8 +1760,8 @@ class CommonFuncitons:
                 return
 
             # Locate the raw input file(s). Partners frequently deliver the
-            # hash-token table split across many partition shards (e.g. AVH
-            # ships ~21 `Epic_Hash_Datavant_*.txt_N_N_N.csv` shards and TMH
+            # hash-token table split across many partition shards (e.g. one
+            # partner ships ~21 `*_N_N_N.csv` shards and another
             # ships 4 `TMH_PCORI_Epic_Link_N.txt` files). Historically only
             # `matching_files[0]` was processed, silently dropping every other
             # shard from the published match-export file. We now concatenate
@@ -1782,13 +1781,13 @@ class CommonFuncitons:
 
             # Timestamp shared by all output artifacts for this run.
             timestamp        = datetime.now().strftime("%Y%m%d_%H%M%S")
-            # Sanitize forward slashes in `folder` (e.g. "BND/20260618") so
+            # Sanitize forward slashes in `folder` (e.g. "PARTNER/20260618") so
             # the value can be safely embedded as a filename component
             # without creating an accidental subdirectory in the output
             # path. The Datavant CLI rejects `-o` values whose parent
             # directory does not already exist ("The specified output
             # argument is not a valid file path or directory"), so an
-            # unsanitized `bnd_BND/20260618_hash_token_...csv` fails with
+            # unsanitized `partner_PARTNER/20260618_hash_token_...csv` fails with
             # rc=2 before the CLI can even open its own log files.
             folder_slug      = folder.replace("/", "_").replace("\\", "_")
             base_output_name = f"{partner}_{folder_slug}_hash_token_{timestamp}"
@@ -1968,7 +1967,7 @@ class CommonFuncitons:
         Writes the header from the first shard exactly once, then streams the
         body (every line after the header) of each shard in order. Partners
         that deliver a hash-token table split across many partition shards
-        (e.g. AVH's ~21 ``Epic_Hash_Datavant_*.txt_N_N_N.csv`` files, TMH's 4
+        (e.g. one partner's ~21 ``*_N_N_N.csv`` files, another's 4
         ``TMH_PCORI_Epic_Link_N.txt`` files) are recombined here so downstream
         Datavant transforms operate on the complete population rather than a
         single shard.
@@ -2191,7 +2190,7 @@ class CommonFuncitons:
         Args:
             target_file            : Path to the Datavant --to output file.
                                      Rewritten in place.
-            source_code            : Uppercase short code (e.g. ``'UFH'``).
+            source_code            : Uppercase short code (e.g. ``'PARTNERA'``).
             source_site_name_value : When non-empty, an extra
                                      ``source_site_name`` column is appended
                                      with this literal. Empty string disables
@@ -2227,7 +2226,7 @@ class CommonFuncitons:
 
         # Locate the pre-existing TOKEN_ENCRYPTION_KEY / SOURCE_SITE_NAME
         # column indices from the header row (case-insensitive). Either
-        # column may legitimately be absent (e.g. UMI has 34 raw columns
+        # column may legitimately be absent (e.g. one partner has 34 raw columns
         # and no SOURCE_SITE_NAME until this method appends it), in which
         # case the corresponding override is skipped.
         header_cells       = next(csv.reader([first_line], delimiter=in_delim), [])
@@ -2380,12 +2379,12 @@ class CommonFuncitons:
         # parent), attach to the parent JVM's py4j gateway via
         # SparkSession.builder.getOrCreate(), and -- when the fix's Spark
         # job aborts (e.g. the panel_loinc_remover_fix EOFException
-        # observed on EMY 20260610) -- the fix's `spark.stop()` in its
+        # observed on a past production batch) -- the fix's `spark.stop()` in its
         # except block tears down the *parent* driver's JavaSparkContext.
         # Subsequent ETL phases (multi_tables_fixer, then upload) then
         # fail with `'NoneType' object has no attribute 'setCallSite'`
         # and `Cannot call methods on a stopped SparkContext`, which is
-        # exactly what happened to the EMY 20260610 batch's CONDITION
+        # exactly what happened to a past production batch's CONDITION
         # upload at 11:47:56 EDT after panel_loinc_remover_fix crashed
         # at 11:36:52 EDT.
         #
@@ -3330,7 +3329,7 @@ class CommonFuncitons:
 
         Args:
             partner: Partner identifier (lowercased).
-            folder_name: Data delivery folder (e.g. 'UCI/20251121').
+            folder_name: Data delivery folder (e.g. 'PARTNER/20251121').
             group_name: Logical group name; used as the output subdirectory
                 and as the section title in the PDF report. For groups of
                 a single file this typically equals the user's ``-t`` pattern
@@ -5803,10 +5802,10 @@ class CommonFuncitons:
         demographic ZIP) rather than receiving it from the partner:
 
         - at merge-upload time for partners flagged
-          ``OVID_BUILDS_LDS_ADDRESS_HISTORY = True`` (emy, tmh), and
+          ``OVID_BUILDS_LDS_ADDRESS_HISTORY = True``, and
         - at fix time via ``append_to_existing_lds_address_hx_fix`` v2.0 for
           full-refresh (``no_merge``) partners that still need the address
-          history carried across cycles (nch).
+          history carried across cycles.
 
         Because the rows are rebuilt every cycle, a plain primary-key anti-join
         merge (see :meth:`merge_dfs`) cannot express address moves and loses
@@ -6898,10 +6897,10 @@ class CommonFuncitons:
                 filename, uppercased, extension stripped (e.g.
                 ``SS_MEASUREMENT_20260319``).
             folder_name: Folder argument as supplied by the user
-                (e.g. ``EMY/20260319``). Only the basename is used to
+                (e.g. ``PARTNER/20260319``). Only the basename is used to
                 construct the Snowflake schema name.
             db_type: One of ``SF``, ``PG``, ``MSSQL`` (case-insensitive).
-            partner_name: Partner short-name (e.g. ``emy``). Currently
+            partner_name: Partner short-name (e.g. ``partnera``). Currently
                 informational only, kept on the signature so future
                 partner-aware behavior (e.g. RAW_{partner}_{folder}
                 schema naming) can be wired in without changing callers.
@@ -6949,7 +6948,7 @@ class CommonFuncitons:
                 Spark master container.
             table_name: Final Snowflake table name (uppercase, no extension).
             folder_name: Folder argument as supplied by the user (e.g.
-                ``EMY/20260319``). Only the basename (``20260319``) is
+                ``PARTNER/20260319``). Only the basename (``20260319``) is
                 used to build the schema name.
             partner_name: Partner short-name (informational; preserved on
                 the signature for symmetry with :meth:`db_upload_snowflake`).
@@ -6963,7 +6962,7 @@ class CommonFuncitons:
         SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
 
         # Schema name: RAW_{folder_basename}, uppercased.
-        # Folder may be passed as 'EMY/20260319' or just '20260319'.
+        # Folder may be passed as 'PARTNER/20260319' or just '20260319'.
         folder_base = folder_name.split('/')[-1] if '/' in folder_name else folder_name
         db_schema_name = f"RAW_{folder_base.upper()}"
 
@@ -6990,8 +6989,8 @@ class CommonFuncitons:
             # `""patid"" VARCHAR(N), ...` -- which Snowflake parses as a
             # bare `""` token followed by `VARCHAR(...)`, raising
             # `syntax error ... unexpected '""'` and `unexpected 'VARCHAR'`.
-            # Observed on the EMY 20260610 external_meds delivery; matches
-            # the equivalent fix already applied to the EMY external_meds
+            # Observed on a past external_meds delivery; matches
+            # the equivalent fix already applied to the external_meds
             # CDM formatter on 2026-06-11. Clean deliveries are unaffected
             # by the option (it is a no-op when no leading whitespace is
             # present after the separator).
@@ -7768,7 +7767,7 @@ class CommonFuncitons:
         # destroys any DataFrame the caller is currently holding.
         #
         # Concrete failure mode the destructive variant introduced
-        # (observed in the EMY 20260610 batch's CONDITION upload at
+        # (observed in a past production batch's CONDITION upload at
         # 19:10:24 EDT on 2026-06-11): db_upload_snowflake() calls
         # cls.get_spark_session("Upload"), then spark.read.load(...) to
         # produce a lazy `file_df`, then cls.get_sf_schema(file_df, ...)
@@ -9376,7 +9375,7 @@ class CommonFuncitons:
         # the gateway state becomes unrecoverable and every subsequent
         # subprocess fails in <1 second with "Only one SparkContext should
         # be running in this JVM (see SPARK-2243)" -- the cascade observed
-        # in the EMY 20260610 batch (jobs 22, 23, 24 collapsed within
+        # in a past production batch (jobs 22, 23, 24 collapsed within
         # 4 seconds after job 21's malformed-header crash). Scrubbing the
         # vars forces every subprocess to start a clean JVM gateway and
         # contains the blast radius of any single formatter crash.

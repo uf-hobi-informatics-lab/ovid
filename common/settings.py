@@ -50,6 +50,11 @@ DEFAULT_JOBS            = 'all'
 DEFAULT_TABLES          = 'all'
 DEFAULT_DB_TYPE         = 'sf'
 DEFAULT_DB_SERVER       = ''
+
+# Host name / IP advertised by the Spark master and workers (SPARK_PUBLIC_DNS)
+# and used in the Spark UI links that Ovid logs. Set it to this machine's
+# address if you open the Spark UI from another computer.
+SPARK_PUBLIC_HOST       = 'localhost'
 ###################################################################################################################################
 ###################################################################################################################################
 
@@ -444,7 +449,7 @@ PCORNET_PRIMARY_KEYS = {
                 "PAT_RELATIONSHIP"   :["PATID_1",'PATID_2','RELATIONSHIP_TYPE'],
                 "EXTERNAL_MEDS"      :["EXTMEDID"],
                 # Added 2026-06-12 to close the merge-upload `'NoneType' object
-                # is not iterable` crash that surfaced in the EMY 20260610
+                # is not iterable` crash that surfaced in a past production batch
                 # batch (instance 20260611-132103-60d85e) at
                 # commonFunctions.py:5062 when uploading PRIVATE_ADDRESS_HISTORY.
                 # Keys verified against the PCORnet CDM v7.0 RELATIONAL sheet
