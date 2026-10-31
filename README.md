@@ -2,8 +2,8 @@
 Developed and maintained by **OneFlorida+**
 
 **Contacts:**
-- Abdelali Nouina - abdelali@ufl.edu
 - Alexander T. Loiacono - atloiaco@ufl.edu
+- Abdelali Nouina - abdelali@ufl.edu
 
 Last Updated: 10/28/2026
 
